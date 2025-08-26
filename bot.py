@@ -1,7 +1,8 @@
 # bot.py
-# AntiZalipBot — MVP c меню, таймерами, статистикой, стриками и аналитикой events
-# Зависимости: aiogram<3.6, python-dotenv>=1.0,<2.0, aiosqlite
-# Python 3.12 (на Render зафиксируй PYTHON_VERSION=3.12.5 или runtime.txt)
+# AntiZalipBot — MVP с меню, таймерами, статистикой, стриками, аналитикой events
+# + Healthcheck web-сервер для Render Free (порт сканер)
+# Требования: aiogram<3.6, python-dotenv>=1.0,<2.0, aiosqlite
+# Рантайм в облаке: PYTHON_VERSION=3.12.5 (или runtime.txt: python-3.12.5)
 
 import os
 import asyncio
@@ -16,6 +17,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import web
 import aiosqlite
 
 # ===================== ЛОГИ =====================
@@ -299,7 +301,7 @@ async def cmd_stats(msg: types.Message):
     )
     await msg.answer(text, parse_mode="Markdown", reply_markup=main_menu_kb())
 
-# -------- Админ-сводки (присылают агрегаты по events) --------
+# -------- Админ-сводки --------
 @dp.message(Command("adm_today"))
 async def adm_today(msg: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -477,10 +479,31 @@ async def cb_sleep(call: types.CallbackQuery):
     )
     await call.answer()
 
+# ===================== HEALTHCHECK WEB (для Render Free) =====================
+async def _healthcheck(request: web.Request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", _healthcheck)
+    app.router.add_get("/health", _healthcheck)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info(f"🌐 Healthcheck server started on 0.0.0.0:{port}")
+
 # ===================== ТОЧКА ВХОДА =====================
 async def main():
     logger.info("Инициализация БД…")
     await init_db()
+
+    # запускаем веб-сервер (обманка порта для Render Web Service)
+    asyncio.create_task(start_web_server())
+
     logger.info("✅ AntiZalipBot запущен")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 

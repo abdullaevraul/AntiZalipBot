@@ -1,6 +1,7 @@
 # bot.py
-# AntiZalipBot — Хороший MVP с /stats и стриками
-# Python 3.12, aiogram < 3.6, python-dotenv 1.x, aiosqlite
+# AntiZalipBot — MVP c меню, таймерами, статистикой, стриками и аналитикой events
+# Зависимости: aiogram<3.6, python-dotenv>=1.0,<2.0, aiosqlite
+# Python 3.12 (на Render зафиксируй PYTHON_VERSION=3.12.5 или runtime.txt)
 
 import os
 import asyncio
@@ -105,6 +106,8 @@ HELP_TEXT = (
     "/stop — остановить активный таймер\n"
     "/help — помощь\n"
     "/stats — статистика и серия дней\n"
+    "/adm_today — сводка за сегодня\n"
+    "/adm_week — сводка за 7 дней\n"
 )
 
 WELCOME_TEXT = (
@@ -131,6 +134,15 @@ async def init_db():
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                value INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
         await db.commit()
 
 async def ensure_user(user_id: int):
@@ -153,6 +165,15 @@ async def record_session(user_id: int, minutes: int):
         )
         await db.commit()
 
+async def log_event(user_id: int, event: str, value: int | None = None):
+    await ensure_user(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO events (user_id, event, value, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, event, value, datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+
 async def fetch_stats(user_id: int):
     await ensure_user(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -164,7 +185,7 @@ async def fetch_stats(user_id: int):
         total_cnt, total_min = await cur.fetchone()
 
         # today
-        today_start = datetime.now(timezone.utc).date().isoformat()
+        today = date.today().isoformat()
         cur = await db.execute(
             """
             SELECT COUNT(*), COALESCE(SUM(minutes),0)
@@ -172,13 +193,11 @@ async def fetch_stats(user_id: int):
             WHERE user_id = ?
               AND substr(finished_at,1,10) = ?
             """,
-            (user_id, today_start)
+            (user_id, today)
         )
         today_cnt, today_min = await cur.fetchone()
 
-        # streak: считаем подряд идущие дни, заканчивая сегодняшним,
-        # в которые есть хотя бы одна сессия.
-        # Берём distinct даты, сортируем по убыванию и считаем подряд.
+        # streak
         cur = await db.execute(
             """
             SELECT DISTINCT substr(finished_at,1,10) AS d
@@ -197,7 +216,6 @@ async def fetch_stats(user_id: int):
                 streak += 1
                 cur_day = cur_day - timedelta(days=1)
             elif d == (cur_day - timedelta(days=1)):
-                # пропуск дня не допускаем: если следующий — вчера, продолжаем
                 streak += 1
                 cur_day = cur_day - timedelta(days=1)
             else:
@@ -222,10 +240,11 @@ async def cancel_user_timer(uid: int):
         task.cancel()
 
 async def schedule_timer(chat_id: int, user_id: int, minutes: int):
-    """Асинхронная задача: ждёт minutes, логирует результат в БД, затем шлёт сообщение с кнопками."""
+    """Асинхронная задача: ждёт minutes, логирует результат, затем шлёт сообщение с кнопками."""
     try:
         await asyncio.sleep(minutes * 60)
         await record_session(user_id, minutes)
+        await log_event(user_id, "timer_finish", minutes)
         timer_meta.pop(user_id, None)
         active_timers.pop(user_id, None)
         await bot.send_message(
@@ -240,6 +259,7 @@ async def start_timer(chat_id: int, user_id: int, minutes: int):
     await cancel_user_timer(user_id)
     until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     timer_meta[user_id] = (until, minutes)
+    await log_event(user_id, "timer_start", minutes)
     task = asyncio.create_task(schedule_timer(chat_id, user_id, minutes))
     active_timers[user_id] = task
 
@@ -247,10 +267,12 @@ async def start_timer(chat_id: int, user_id: int, minutes: int):
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await ensure_user(msg.from_user.id)
+    await log_event(msg.from_user.id, "start")
     await msg.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
 @dp.message(Command("menu"))
 async def cmd_menu(msg: types.Message):
+    await log_event(msg.from_user.id, "menu_open")
     await msg.answer("Главное меню:", reply_markup=main_menu_kb())
 
 @dp.message(Command("help"))
@@ -260,10 +282,12 @@ async def cmd_help(msg: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(msg: types.Message):
     await cancel_user_timer(msg.from_user.id)
+    await log_event(msg.from_user.id, "stop")
     await msg.answer("⏹ Таймер остановлен. Контроль у тебя.", reply_markup=main_menu_kb())
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
+    await log_event(msg.from_user.id, "stats_open")
     s = await fetch_stats(msg.from_user.id)
     text = (
         "📊 *Твоя статистика*\n\n"
@@ -275,9 +299,33 @@ async def cmd_stats(msg: types.Message):
     )
     await msg.answer(text, parse_mode="Markdown", reply_markup=main_menu_kb())
 
+# -------- Админ-сводки (присылают агрегаты по events) --------
+@dp.message(Command("adm_today"))
+async def adm_today(msg: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT COUNT(DISTINCT user_id), COUNT(*)
+            FROM events
+            WHERE substr(created_at,1,10)=date('now')
+        """)
+        users, events = await cur.fetchone()
+    await msg.answer(f"📊 Сегодня: {users} уникальных пользователей, {events} событий")
+
+@dp.message(Command("adm_week"))
+async def adm_week(msg: types.Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT COUNT(DISTINCT user_id), COUNT(*)
+            FROM events
+            WHERE created_at >= datetime('now','-7 days')
+        """)
+        users, events = await cur.fetchone()
+    await msg.answer(f"📊 За 7 дней: {users} уникальных пользователей, {events} событий")
+
 # ===================== ОБРАБОТЧИКИ: КНОПКИ МЕНЮ =====================
 @dp.callback_query(F.data == "menu:root")
 async def cb_menu_root(call: types.CallbackQuery):
+    await log_event(call.from_user.id, "menu_open")
     await call.message.edit_text(WELCOME_TEXT, reply_markup=main_menu_kb())
     await call.answer()
 
@@ -325,8 +373,7 @@ async def cb_timer(call: types.CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    # timer:5 / timer:15 / timer:30
-    minutes = int(data.split(":")[1])
+    minutes = int(data.split(":")[1])  # 5/15/30
     await start_timer(chat_id, uid, minutes)
     mot = pick_motivation(uid, minutes)
     await call.message.edit_text(
@@ -369,6 +416,7 @@ async def custom_minutes_input(msg: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "stop")
 async def cb_stop(call: types.CallbackQuery):
     await cancel_user_timer(call.from_user.id)
+    await log_event(call.from_user.id, "stop")
     await call.message.edit_text("⏹ Таймер остановлен. Что дальше?", reply_markup=main_menu_kb())
     await call.answer()
 

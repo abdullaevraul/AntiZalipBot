@@ -1,0 +1,14 @@
+# secrets
+.env
+
+# local db / cache
+*.db
+__pycache__/
+*.pyc
+
+# venv / os junk
+.venv*/
+.DS_Store
+
+# editors misc
+*.rtf

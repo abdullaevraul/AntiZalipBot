@@ -939,12 +939,33 @@ async def nightly_digest_loop():
 
 # ---------- main ----------
 async def main():
+    logging.info("🚀 AntiZalipBot запускается...")
+
     await init_db()
     log.info("✅ DB init complete")
+
+    bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
+    dp = Dispatcher()
+
+    # Регистрируем команды (чтобы убрать плашку в Telegram)
+    await bot.set_my_commands([
+        types.BotCommand(command="start", description="Перезапуск / онбординг"),
+        types.BotCommand(command="menu", description="Главное меню"),
+        types.BotCommand(command="stats", description="Статистика"),
+        types.BotCommand(command="help", description="Польза и функции"),
+    ])
+
+    # Подключаем роутеры
+    dp.include_router(router)
+
+    # Запускаем веб-сервер и фоновые задачи
     asyncio.create_task(start_web_server())
     asyncio.create_task(nightly_digest_loop())
+
+    # Вечный цикл, чтобы процесс не умирал
     while True:
         await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

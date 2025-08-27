@@ -737,12 +737,22 @@ async def start_web_server():
     log.info(f"🌐 Web server started on :{port}")
     await set_webhook()
 
-# ---------- main ----------
+# ---------- main (keep-alive loop) ----------
 async def main():
     await init_db()
+
+    # стартуем веб-сервер с healthcheck и webhook-роутом
     asyncio.create_task(start_web_server())
+
+    # ночной дайджест в фоне
     asyncio.create_task(nightly_digest_loop())
-    # В webhook-режиме polling НЕ запускаем
+
+    # держим процесс живым, даже если фоновые таски упадут
+    try:
+        while True:
+            await asyncio.sleep(3600)  # раз в час просто «живём»
+    except asyncio.CancelledError:
+        pass  # корректное завершение по сигналу
 
 if __name__ == "__main__":
     asyncio.run(main())

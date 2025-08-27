@@ -1,6 +1,5 @@
-# AntiZalipBot — Webhook + UX (онбординг, не теряем таймер, чистый чат)
-# Render Web Service Free
-
+# AntiZalipBot — webhook, Postgres, PostHog, onboarding, smart timers, AI limits
+# Python 3.12 • aiogram 3.5
 import os
 import asyncio
 import logging
@@ -8,7 +7,8 @@ import random
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
-import aiosqlite
+import asyncpg
+import httpx
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -20,35 +20,39 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Update
 
-# ---------- OpenAI ----------
+# ---------- OpenAI (опционально) ----------
 try:
     from openai import AsyncOpenAI
 except Exception:
     AsyncOpenAI = None
 
-# ---------- Config / ENV ----------
+# ---------- ENV ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN отсутствует. Добавь в .env или Render → Environment.")
+    raise RuntimeError("TELEGRAM_TOKEN отсутствует (добавь в .env или Render → Environment).")
+
+BASE_URL       = os.getenv("BASE_URL")  # https://<service>.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "antizalip_secret")
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # опционально
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 MODEL_NAME      = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
-# Webhook
-BASE_URL       = os.getenv("BASE_URL")  # пример: https://antizalipbot.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super_secret_path")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase/Neon URI
 
-# Digest
+POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY")
+POSTHOG_HOST    = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
+
 DIGEST_TZ   = os.getenv("DIGEST_TZ", "Europe/Moscow")
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "22"))
 
-# ИИ лимиты
 MAX_AI_CALLS_PER_DAY = int(os.getenv("MAX_AI_CALLS_PER_DAY", "30"))
-MAX_DAILY_SPEND      = float(os.getenv("MAX_DAILY_SPEND", "1.0"))  # $ в сутки
+MAX_DAILY_SPEND      = float(os.getenv("MAX_DAILY_SPEND", "1.0"))  # $/day
+
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -59,7 +63,7 @@ session = AiohttpSession()
 bot = Bot(TOKEN, session=session)
 dp = Dispatcher()
 
-# ---------- OpenAI Client ----------
+# ---------- OpenAI ----------
 oa_client = None
 if OPENAI_API_KEY and AsyncOpenAI:
     try:
@@ -68,142 +72,147 @@ if OPENAI_API_KEY and AsyncOpenAI:
     except Exception as e:
         log.warning(f"OpenAI init failed: {e}")
 
-# ---------- DB ----------
-DB_PATH = os.path.join(BASE_DIR, "bot.db")
+# ---------- Postgres ----------
+DB_POOL: asyncpg.Pool | None = None
+async def get_pool() -> asyncpg.Pool:
+    global DB_POOL
+    if DB_POOL is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL не задан (Supabase/Neon URI).")
+        DB_POOL = await asyncpg.create_pool(DATABASE_URL, max_size=10)
+    return DB_POOL
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_digest_date TEXT,
-            seen_nudge INTEGER DEFAULT 0,
-            seen_onboarding INTEGER DEFAULT 0
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+          user_id BIGINT PRIMARY KEY,
+          created_at TIMESTAMPTZ DEFAULT now(),
+          seen_nudge BOOLEAN DEFAULT FALSE,
+          seen_onboarding BOOLEAN DEFAULT FALSE,
+          last_digest_date DATE
         )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            event TEXT,
-            value REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS events(
+          id BIGSERIAL PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          event TEXT NOT NULL,
+          value NUMERIC,
+          created_at TIMESTAMPTZ DEFAULT now()
         )""")
-        # миграции (мягко добавляем недостающие поля)
-        try: await db.execute("ALTER TABLE users ADD COLUMN seen_nudge INTEGER DEFAULT 0")
-        except Exception: pass
-        try: await db.execute("ALTER TABLE users ADD COLUMN seen_onboarding INTEGER DEFAULT 0")
-        except Exception: pass
-        await db.commit()
+        await con.execute("CREATE INDEX IF NOT EXISTS idx_events_user_created ON events(user_id, created_at DESC)")
+        await con.execute("CREATE INDEX IF NOT EXISTS idx_events_event_created ON events(event, created_at DESC)")
 
 async def ensure_user(uid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
-        await db.commit()
-
-async def set_seen_nudge(uid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET seen_nudge=1 WHERE user_id=?", (uid,))
-        await db.commit()
-
-async def get_seen_nudge(uid: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COALESCE(seen_nudge,0) FROM users WHERE user_id=?", (uid,))
-        row = await cur.fetchone()
-        return bool(row and row[0])
-
-async def get_seen_onboarding(uid: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COALESCE(seen_onboarding,0) FROM users WHERE user_id=?", (uid,))
-        row = await cur.fetchone()
-        return bool(row and row[0])
-
-async def set_seen_onboarding(uid: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET seen_onboarding=1 WHERE user_id=?", (uid,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT (user_id) DO NOTHING", uid)
 
 async def log_event(uid: int, event: str, value: float | None = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO events(user_id,event,value) VALUES(?,?,?)", (uid, event, value))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("INSERT INTO events(user_id,event,value) VALUES($1,$2,$3)", uid, event, value)
 
-# ---------- Stats ----------
+async def get_seen_onboarding(uid: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchval("SELECT seen_onboarding FROM users WHERE user_id=$1", uid)
+        return bool(row)
+
+async def set_seen_onboarding(uid: int):
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE users SET seen_onboarding=TRUE WHERE user_id=$1", uid)
+
+async def get_seen_nudge(uid: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        return bool(await con.fetchval("SELECT seen_nudge FROM users WHERE user_id=$1", uid))
+
+async def set_seen_nudge(uid: int):
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE users SET seen_nudge=TRUE WHERE user_id=$1", uid)
+
 async def fetch_stats(uid: int) -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM events WHERE user_id=? AND event='battle_win'", (uid,))
-        wins, = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*) FROM events WHERE user_id=? AND event='battle_lose'", (uid,))
-        loses, = await cur.fetchone()
-        cur = await db.execute("SELECT COALESCE(SUM(value),0) FROM events WHERE user_id=? AND event='battle_win'", (uid,))
-        reclaimed, = await cur.fetchone()
-        cur = await db.execute("""
-            SELECT COUNT(*), COALESCE(SUM(value),0)
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        wins   = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='battle_win'", uid) or 0
+        loses  = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='battle_lose'", uid) or 0
+        recl   = await con.fetchval(
+            "SELECT COALESCE(SUM(value),0) FROM events WHERE user_id=$1 AND event='battle_win'", uid
+        ) or 0
+        row    = await con.fetchrow("""
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(value),0) AS minutes
             FROM events
-            WHERE user_id=? AND event='timer_done' AND substr(created_at,1,10)=date('now')
-        """, (uid,))
-        today_cnt, today_min = await cur.fetchone()
+            WHERE user_id=$1 AND event='timer_done' AND created_at::date=CURRENT_DATE
+        """, uid)
     return {
-        "wins": int(wins or 0),
-        "loses": int(loses or 0),
-        "reclaimed": int(reclaimed or 0),
-        "today_cnt": int(today_cnt or 0),
-        "today_min": int(today_min or 0),
+        "wins": int(wins), "loses": int(loses), "reclaimed": int(recl),
+        "today_cnt": int(row["cnt"]), "today_min": int(row["minutes"])
     }
 
 async def free_chat_count_today(uid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        n = await con.fetchval("""
             SELECT COUNT(*) FROM events
-            WHERE user_id=? AND event='free_chat' AND substr(created_at,1,10)=date('now')
-        """, (uid,))
-        n, = await cur.fetchone()
+            WHERE user_id=$1 AND event='free_chat' AND created_at::date=CURRENT_DATE
+        """, uid)
     return int(n or 0)
 
 # ---------- AI limits ----------
 async def ai_calls_today(uid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT COUNT(*) FROM events
-            WHERE user_id=? AND event='ai_call' AND substr(created_at,1,10)=date('now')
-        """, (uid,))
-        n, = await cur.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        n = await con.fetchval("""
+            SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='ai_call' AND created_at::date=CURRENT_DATE
+        """, uid)
     return int(n or 0)
 
-async def can_use_ai(uid: int) -> bool:
-    return (await ai_calls_today(uid)) < MAX_AI_CALLS_PER_DAY
-
-async def mark_ai_call(uid: int):  await log_event(uid, "ai_call", 1)
-async def mark_ai_block(uid: int): await log_event(uid, "ai_block", 1)
-
 async def total_spend_today() -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        val = await con.fetchval("""
             SELECT COALESCE(SUM(value),0) FROM events
-            WHERE event='ai_usd' AND substr(created_at,1,10)=date('now')
+            WHERE event='ai_usd' AND created_at::date=CURRENT_DATE
         """)
-        val, = await cur.fetchone()
     return float(val or 0.0)
 
 async def add_spend(amount: float):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO events(user_id,event,value) VALUES(?,?,?)", (0, 'ai_usd', float(amount)))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("INSERT INTO events(user_id,event,value) VALUES(0,'ai_usd',$1)", float(amount))
 
-async def can_spend(amount: float) -> bool:
-    return (await total_spend_today()) + float(amount) <= MAX_DAILY_SPEND
+# ---------- PostHog ----------
+async def track(uid: int, event: str, props: dict | None = None):
+    if not POSTHOG_API_KEY:
+        return
+    payload = {
+        "api_key": POSTHOG_API_KEY,
+        "event": event,
+        "distinct_id": str(uid),
+        "properties": props or {},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{POSTHOG_HOST}/capture/", json=payload)
+    except Exception:
+        pass
 
 # ---------- AI generation ----------
 SYSTEM_COACH = (
-    "Ты жёсткий, но уважительный тренер по фокусу. "
-    "Отвечай коротко (2–4 фразы), по делу, с одним понятным микро-шагом ≤2 минут. "
-    "Не используй 'туплю/выгорел/депрессия'. Больше про действия и фокус."
+    "Ты помощник по фокусу: коротко, по делу, 2–3 фразы. "
+    "Дай один конкретный шаг ≤2 минут, без психотерапии, без слов 'депрессия/выгорание/туплю'."
 )
 
 async def ai_generate(prompt: str, temperature: float = 0.8, max_tokens: int = 200) -> str | None:
     if not oa_client:
         return random.choice([
-            "Сделай паузу на 30 секунд, расправь плечи, вдохни глубоко. Выбери одно дело и начни с простого шага.",
-            "Отложи телефон на стол, сделай 5 вдохов. Дальше — 2 минуты на самом простом действии.",
-            "Закрой лишнюю вкладку и выдели 120 секунд на одно короткое действие.",
+            "Сделай 5 глубоких вдохов, запиши один следующий шаг и начни его сейчас на 2 минуты.",
+            "Положи телефон экраном вниз. Открой нужный файл/таску и дай себе 120 секунд простого действия.",
+            "Закрой лишние вкладки и сделай один маленький шаг. Главное — начать на 2 минуты.",
         ])
     try:
         resp = await oa_client.chat.completions.create(
@@ -220,33 +229,33 @@ async def ai_generate(prompt: str, temperature: float = 0.8, max_tokens: int = 2
         log.warning(f"AI error: {e}")
         return None
 
+async def can_use_ai(uid: int) -> bool:
+    return (await ai_calls_today(uid)) < MAX_AI_CALLS_PER_DAY
+
+async def can_spend(amount: float) -> bool:
+    return (await total_spend_today()) + float(amount) <= MAX_DAILY_SPEND
+
 async def ai_reply(uid: int, prompt: str, temperature=0.8, max_tokens=200) -> str:
     if not await can_use_ai(uid):
-        await mark_ai_block(uid)
-        return "Сегодня ты уже много общался с тренером 🤖. Без ИИ: 30 сек пауза, 5 вдохов, одно простое действие."
+        await log_event(uid, "ai_block", 1)
+        return "Сегодня лимит подсказок исчерпан. Без ИИ: 5 вдохов и 2 минуты на самый простой шаг."
     est_cost = (max_tokens / 1000.0) * 0.0006  # грубая оценка
     if not await can_spend(est_cost):
-        await mark_ai_block(uid)
-        return "Сегодня общий лимит расходов достигнут 💸. Завтра вернём ИИ. Сейчас — короткий шаг на 2 минуты."
+        await log_event(uid, "ai_block", 1)
+        return "На сегодня достигли глобального лимита 💸. Завтра ИИ вернётся. Сейчас — мини-шаг на 2 минуты."
     text = await ai_generate(prompt, temperature=temperature, max_tokens=max_tokens)
-    await mark_ai_call(uid)
+    await log_event(uid, "ai_call", 1)
     await add_spend(est_cost)
-    return text or "Сделай короткую паузу, расправь плечи и выдели 2 минуты на одно действие."
+    return text or "Сделай короткую паузу, расправь плечи и начни с шага на 2 минуты."
 
-# ---------- Chat cleanliness with tags ----------
-# Храним последний бот-месседж и его "тег" (тип), чтобы выборочно НЕ удалять (например, таймер)
-LAST_BOT_MSG: dict[tuple[int, int], tuple[int, str | None]] = {}  # (chat_id, user_id) -> (message_id, tag)
-
-def is_private(obj) -> bool:
-    chat = obj.chat if isinstance(obj, types.Message) else obj.message.chat
-    return chat.type == "private"
+# ---------- Chat cleanliness ----------
+LAST_BOT_MSG: dict[tuple[int, int], tuple[int, str | None]] = {}  # (chat_id,user_id) -> (msg_id, tag)
 
 async def send_clean(chat_id: int, user_id: int, text: str,
                      reply_markup: types.InlineKeyboardMarkup | None = None,
                      parse_mode: str | None = None,
                      tag: str | None = None,
                      preserve_tags: set[str] | None = None):
-    """Удаляет прошлое бот-сообщение, КРОМЕ случаев, когда у него тег из preserve_tags."""
     key = (chat_id, user_id)
     mid_tag = LAST_BOT_MSG.get(key)
     if mid_tag:
@@ -276,10 +285,10 @@ async def delete_after(chat_id: int, message_id: int, seconds: int = 20):
 # ---------- Keyboards ----------
 def main_menu_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🎯 Вернуть фокус", callback_data="battle:start")],
+        [types.InlineKeyboardButton(text="🎯 Вернуть фокус", callback_data="focus:start")],
         [
             types.InlineKeyboardButton(text="⏳ Таймеры", callback_data="menu:timer"),
-            types.InlineKeyboardButton(text="💬 Тренеру", callback_data="ask"),
+            types.InlineKeyboardButton(text="💬 Помощник", callback_data="ask"),
         ],
         [
             types.InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats"),
@@ -294,38 +303,38 @@ def timers_kb() -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(text="15 мин", callback_data="timer:15"),
             types.InlineKeyboardButton(text="30 мин", callback_data="timer:30"),
         ],
+        [types.InlineKeyboardButton(text="🍅 Помидор 25/5", callback_data="timer:pomodoro")],
         [types.InlineKeyboardButton(text="Свой…", callback_data="timer:custom")],
         [types.InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:root")],
     ])
 
+def onboarding_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="🏁 Не могу начать", callback_data="ob:start"),
+            types.InlineKeyboardButton(text="📱 Отвлекаюсь", callback_data="ob:distraction"),
+        ],
+        [
+            types.InlineKeyboardButton(text="😵 Перегруз", callback_data="ob:overload"),
+            types.InlineKeyboardButton(text="☕ Перерыв", callback_data="ob:break"),
+        ],
+        [types.InlineKeyboardButton(text="✍️ Напишу сам", callback_data="ask")],
+    ])
+
 # ---------- Texts ----------
 ONBOARDING_TEXT = (
-    "Привет 👋 Я AntiZalipBot — твой анти-прокрастинационный тренер.\n\n"
-    "Помогаю, когда откладываешь дела, теряешь фокус или залипаешь в телефон.\n\n"
-    "Что я умею:\n"
-    "• 🎯 Вернуть фокус — короткий челлендж на 30–60 секунд\n"
-    "• 💬 Свободный чат — опиши ситуацию, дам план на 2–4 фразы\n"
-    "• ⏳ Таймеры 5/15/30 или свой\n"
-    "• 📊 Статистика — сколько фокуса ты вернул\n\n"
-    "Готов? Жми «Погнали!» 👇"
-)
-WELCOME_TEXT = (
-    "Главное меню. Выбирай действие ниже или напиши своими словами — отвечу как тренер."
+    "Привет 👋 Я AntiZalip — помощник по фокусу.\n\n"
+    "Что мешает прямо сейчас?"
 )
 HELP_TEXT = (
-    "Я помогаю остановить прокрастинацию и вернуть фокус.\n\n"
-    "Что я умею:\n"
-    "• 🎯 Вернуть фокус — короткий челлендж\n"
-    "• 💬 Свободный чат — опиши ситуацию, получи план на 2–4 фразы\n"
-    "• ⏳ Таймеры 5/15/30 или свой\n"
-    "• 📊 /stats — победы, минуты фокуса и переписки с тренером\n\n"
-    "Примеры фраз:\n"
-    "• «Откладываю задачу»\n"
-    "• «Не могу собраться начать»\n"
-    "• «Уже час занимаюсь не тем»\n"
-    "• «Залип в телефон»\n"
-    "• «Отвлёкся и потерял фокус»"
+    "Как я помогаю:\n"
+    "• 🎯 Вернуть фокус — короткий челлендж на 30–60 сек\n"
+    "• 💬 Помощник — опиши ситуацию, получи план на 2–3 фразы\n"
+    "• ⏳ Таймеры 5/15/30 и 🍅 25/5\n"
+    "• 📊 Статистика — минуты фокуса и победы\n\n"
+    "Пиши своими словами в любой момент."
 )
+WELCOME_TEXT = "Главное меню. Выбери действие ниже или напиши своими словами."
 
 # ---------- States ----------
 class TimerStates(StatesGroup):
@@ -343,13 +352,13 @@ async def cancel_user_timer(uid: int):
     timer_meta.pop(uid, None)
     if t and not t.done():
         t.cancel()
+        await log_event(uid, "timer_cancel")
 
 async def schedule_timer(chat_id: int, uid: int, minutes: int):
     try:
         await asyncio.sleep(minutes * 60)
         await log_event(uid, "timer_done", minutes)
-        active_timers.pop(uid, None)
-        timer_meta.pop(uid, None)
+        active_timers.pop(uid, None); timer_meta.pop(uid, None)
         await bot.send_message(
             chat_id,
             f"⏰ {minutes} минут вышло! Что дальше?",
@@ -358,6 +367,7 @@ async def schedule_timer(chat_id: int, uid: int, minutes: int):
                 [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
             ])
         )
+        await track(uid, "timer_done", {"min": minutes})
     except asyncio.CancelledError:
         pass
 
@@ -367,44 +377,74 @@ async def start_timer(chat_id: int, uid: int, minutes: int):
     timer_meta[uid] = (until, minutes)
     task = asyncio.create_task(schedule_timer(chat_id, uid, minutes))
     active_timers[uid] = task
+    await log_event(uid, "timer_start", minutes)
+    await track(uid, "timer_start", {"min": minutes})
 
-# ---------- Nudge (one-time) ----------
+async def schedule_pomodoro(chat_id: int, uid: int):
+    # 25 работы
+    await start_timer(chat_id, uid, 25)
+    try:
+        m = await bot.send_message(
+            chat_id,
+            "🍅 Помидор: 25 минут фокуса запущены.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="⏹ Остановить", callback_data="timer:stop")],
+                [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
+            ])
+        )
+        LAST_BOT_MSG[(chat_id, uid)] = (m.message_id, "timer")
+    except Exception:
+        pass
+    # ждём завершения 25-минутки
+    try:
+        await active_timers[uid]
+    except Exception:
+        return
+    # 5 отдыха
+    await start_timer(chat_id, uid, 5)
+    await bot.send_message(
+        chat_id,
+        "⏳ Отдых 5 минут. Затем продолжим?",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="🔁 Ещё помидор 25/5", callback_data="timer:pomodoro")],
+            [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
+        ])
+    )
+
+# ---------- One-time nudge ----------
 async def maybe_show_free_chat_nudge(uid: int, chat_id: int):
     if await get_seen_nudge(uid):
         return
     m = await bot.send_message(
         chat_id,
         "💬 Можно писать своими словами. Примеры:\n"
-        "• «Откладываю задачу»\n"
-        "• «Не могу собраться начать»\n"
-        "• «Уже час занимаюсь не тем»",
+        "• «Не могу начать»\n"
+        "• «Отвлекаюсь и теряю фокус»\n"
+        "• «Устал — как перезапуститься?»",
     )
-    asyncio.create_task(delete_after(chat_id, m.message_id, 20))
+    asyncio.create_task(delete_after(chat_id, m.message_id, 18))
     await set_seen_nudge(uid)
+
+# ---------- Admin utils ----------
+def is_admin(uid: int) -> bool: return uid in ADMIN_IDS
+def fmt_usd(x: float) -> str: return f"${x:.4f}"
 
 # ---------- Commands ----------
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
-    await ensure_user(msg.from_user.id)
-    await log_event(msg.from_user.id, "start")
-    # онбординг показываем только один раз
-    if not await get_seen_onboarding(msg.from_user.id):
-        await send_clean(
-            msg.chat.id, msg.from_user.id, ONBOARDING_TEXT,
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="🚀 Погнали!", callback_data="menu:root")]
-            ]),
-            tag="onboarding"
-        )
-        await set_seen_onboarding(msg.from_user.id)
+    uid = msg.from_user.id
+    await ensure_user(uid)
+    await log_event(uid, "start")
+    await track(uid, "start", {})
+    if not await get_seen_onboarding(uid):
+        await send_clean(msg.chat.id, uid, ONBOARDING_TEXT, reply_markup=onboarding_kb(), tag="onboarding")
+        await set_seen_onboarding(uid)
         return
-    # иначе — сразу в меню
-    await send_clean(msg.chat.id, msg.from_user.id, WELCOME_TEXT, reply_markup=main_menu_kb(), tag="menu")
-    await maybe_show_free_chat_nudge(msg.from_user.id, msg.chat.id)
+    await send_clean(msg.chat.id, uid, WELCOME_TEXT, reply_markup=main_menu_kb(), tag="menu", preserve_tags={"timer"})
+    await maybe_show_free_chat_nudge(uid, msg.chat.id)
 
 @dp.message(Command("menu"))
 async def cmd_menu(msg: types.Message):
-    # не удаляем таймерное сообщение, если оно последнее
     await send_clean(msg.chat.id, msg.from_user.id, WELCOME_TEXT, reply_markup=main_menu_kb(),
                      tag="menu", preserve_tags={"timer"})
 
@@ -412,12 +452,6 @@ async def cmd_menu(msg: types.Message):
 async def cmd_help(msg: types.Message):
     await send_clean(msg.chat.id, msg.from_user.id, HELP_TEXT, reply_markup=main_menu_kb(),
                      tag="help", preserve_tags={"timer"})
-
-@dp.message(Command("stop"))
-async def cmd_stop(msg: types.Message):
-    await cancel_user_timer(msg.from_user.id)
-    await send_clean(msg.chat.id, msg.from_user.id, "⛔️ Таймер остановлен.", reply_markup=main_menu_kb(),
-                     tag="menu", preserve_tags={"timer"})
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: types.Message):
@@ -429,7 +463,7 @@ async def cmd_stats(msg: types.Message):
         f"🙈 Сдачи: {s['loses']}\n"
         f"⏳ Минуты фокуса: {s['reclaimed']}\n"
         f"⏰ Таймеров сегодня: {s['today_cnt']} (мин: {s['today_min']})\n"
-        f"💬 Сообщений тренеру сегодня: {chats}"
+        f"💬 Сообщений помощнику сегодня: {chats}"
     )
     await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=main_menu_kb(),
                      tag="stats", preserve_tags={"timer"})
@@ -444,25 +478,97 @@ async def ai_status(msg: types.Message):
         f"🤖 AI: {'ON ✅' if ok else 'OFF ❌'}\n"
         f"Model: {MODEL_NAME}\nBase: {OPENAI_BASE_URL or 'default'}\n"
         f"Персональный лимит: {used}/{MAX_AI_CALLS_PER_DAY} (осталось {left})\n"
-        f"Глобальный расход: ${spent:.4f}/{MAX_DAILY_SPEND:.2f}"
+        f"Глобальный расход: {fmt_usd(spent)}/{fmt_usd(MAX_DAILY_SPEND)}"
     )
     await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=main_menu_kb(),
                      tag="stats", preserve_tags={"timer"})
 
-# Пинги / админки (по желанию)
-from datetime import datetime as _dt
-
 @dp.message(Command("ping"))
 async def cmd_ping(msg: types.Message):
-    await msg.answer(f"pong {_dt.utcnow().isoformat(timespec='seconds')}Z")
+    await msg.answer(f"pong {datetime.utcnow().isoformat(timespec='seconds')}Z")
 
 @dp.message(Command("adm_webhook"))
 async def adm_webhook(msg: types.Message):
+    if not is_admin(msg.from_user.id): return
     info = await bot.get_webhook_info()
     txt = (f"URL: {info.url or '-'}\n"
            f"Pending: {info.pending_update_count}\n"
            f"MaxConn: {getattr(info, 'max_connections', 'n/a')}")
     await msg.answer(txt)
+
+@dp.message(Command("adm_report"))
+async def adm_report(msg: types.Message):
+    if not is_admin(msg.from_user.id): return
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        dau = await con.fetchval("SELECT COUNT(DISTINCT user_id) FROM events WHERE created_at::date=CURRENT_DATE") or 0
+        new = await con.fetchval("SELECT COUNT(*) FROM users WHERE created_at::date=CURRENT_DATE") or 0
+        timers = await con.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE event='timer_start') AS starts,
+              COUNT(*) FILTER (WHERE event='timer_done')  AS dones,
+              COALESCE(SUM(value) FILTER (WHERE event='timer_done'),0) AS min_done,
+              COUNT(*) FILTER (WHERE event='timer_cancel') AS cancels
+            FROM events WHERE created_at::date=CURRENT_DATE
+        """)
+        battles = await con.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE event='battle_win')  AS wins,
+              COUNT(*) FILTER (WHERE event='battle_lose') AS loses,
+              COALESCE(SUM(value) FILTER (WHERE event='battle_win'),0) AS reclaimed
+            FROM events WHERE created_at::date=CURRENT_DATE
+        """)
+        ai = await con.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE event='ai_call') AS calls,
+              COALESCE(SUM(value) FILTER (WHERE event='ai_usd'),0) AS usd
+            FROM events WHERE created_at::date=CURRENT_DATE
+        """)
+        free_chat = await con.fetchval("""
+            SELECT COUNT(*) FROM events WHERE event='free_chat' AND created_at::date=CURRENT_DATE
+        """) or 0
+    timer_cr = (int(timers["dones"] or 0) / int(timers["starts"] or 1)) * 100
+    dau_avg_focus = (float(timers["min_done"] or 0) / dau) if dau else 0.0
+    text = (
+        "📈 *AntiZalip — отчёт за сегодня*\n"
+        f"👥 DAU: *{dau}* · 🆕 New: *{new}*\n"
+        f"⏱ Таймеры: старт *{int(timers['starts'] or 0)}*, финиш *{int(timers['dones'] or 0)}* "
+        f"(CR *{timer_cr:.0f}%*), отмен *{int(timers['cancels'] or 0)}*, мин *{int(timers['min_done'] or 0)}*\n"
+        f"🏆 Победы/сдачи: *{int(battles['wins'] or 0)}* / *{int(battles['loses'] or 0)}* · "
+        f"вернул минут: *{int(battles['reclaimed'] or 0)}*\n"
+        f"🤖 AI: вызовов *{int(ai['calls'] or 0)}* · расход *{fmt_usd(float(ai['usd'] or 0.0))}*\n"
+        f"💬 Чатов: *{free_chat}* · ⏳ мин/DAU: *{dau_avg_focus:.1f}*"
+    )
+    await msg.answer(text, parse_mode="Markdown")
+
+# ---------- Onboarding callbacks ----------
+async def onboarding_answer(uid: int, chat_id: int, text: str):
+    # короткий ответ + кнопка «Главное меню»
+    try:
+        await send_clean(
+            chat_id, uid, text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")]
+            ]),
+            tag="onboarding_ans", preserve_tags={"timer"}
+        )
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("ob:"))
+async def cb_onboarding(call: types.CallbackQuery):
+    uid = call.from_user.id
+    variant = call.data.split(":")[1]
+    await track(uid, "onboarding_click", {"variant": variant})
+    answers = {
+        "start": "Запиши одно маленькое действие и сделай его 2 минуты. Начнёшь — поедет.",
+        "distraction": "Положи телефон экраном вниз и закрой лишнюю вкладку. 2 минуты только одно дело.",
+        "overload": "Возьми листок и выпиши 3 пункта. Выбери один — самое простое действие на 2 минуты.",
+        "break": "Сделай 5 вдохов, встань и походи 30 секунд. Затем 2 минуты — один маленький шаг.",
+    }
+    text = answers.get(variant, "Опиши в двух фразах, что происходит — дам точный план.")
+    await onboarding_answer(uid, call.message.chat.id, text)
+    await call.answer()
 
 # ---------- Menu callbacks ----------
 @dp.callback_query(F.data == "menu:root")
@@ -497,7 +603,7 @@ async def cb_menu_stats(call: types.CallbackQuery):
         f"🙈 Сдачи: {s['loses']}\n"
         f"⏳ Минуты фокуса: {s['reclaimed']}\n"
         f"⏰ Таймеров сегодня: {s['today_cnt']} (мин: {s['today_min']})\n"
-        f"💬 Сообщений тренеру сегодня: {chats}"
+        f"💬 Сообщений помощнику сегодня: {chats}"
     )
     try:
         await call.message.edit_text(text, reply_markup=main_menu_kb())
@@ -508,7 +614,61 @@ async def cb_menu_stats(call: types.CallbackQuery):
     finally:
         await call.answer()
 
-# ---------- Timers ----------
+# ---------- Focus (челлендж) ----------
+@dp.callback_query(F.data == "focus:start")
+async def cb_focus(call: types.CallbackQuery):
+    uid = call.from_user.id
+    await ensure_user(uid); await track(uid, "focus_click", {})
+    challenge = random.choice([
+        "Сделай 5 вдохов и встань на 10 секунд.",
+        "Закрой лишнее окно/вкладку прямо сейчас.",
+        "Положи телефон экраном вниз.",
+        "Сделай 10 шагов и вернись к столу.",
+        "Запиши один микро-шаг на бумагу.",
+    ])
+    text = f"🎯 Вернём фокус!\n\nЧеллендж: {challenge}\nСправишься?"
+    try:
+        await call.message.edit_text(
+            text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="✅ Сделал", callback_data="focus:win")],
+                [types.InlineKeyboardButton(text="❌ Пока пропущу", callback_data="focus:lose")],
+            ])
+        )
+        await update_last_tag(call.message.chat.id, uid, "focus")
+    except Exception:
+        await send_clean(call.message.chat.id, uid, text,
+                         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                             [types.InlineKeyboardButton(text="✅ Сделал", callback_data="focus:win")],
+                             [types.InlineKeyboardButton(text="❌ Пока пропущу", callback_data="focus:lose")],
+                         ]), tag="focus", preserve_tags={"timer"})
+    await call.answer()
+
+@dp.callback_query(F.data == "focus:win")
+async def cb_focus_win(call: types.CallbackQuery):
+    uid = call.from_user.id
+    await log_event(uid, "battle_win", 5)
+    s = await fetch_stats(uid)
+    await call.message.edit_text(
+        f"🏆 Отлично! +5 минут в копилку.\nПобед: {s['wins']} | Сдач: {s['loses']}",
+        reply_markup=main_menu_kb()
+    )
+    await update_last_tag(call.message.chat.id, uid, "menu")
+    await call.answer()
+
+@dp.callback_query(F.data == "focus:lose")
+async def cb_focus_lose(call: types.CallbackQuery):
+    uid = call.from_user.id
+    await log_event(uid, "battle_lose", 0)
+    s = await fetch_stats(uid)
+    await call.message.edit_text(
+        f"Ок, позже. Побед: {s['wins']} | Сдач: {s['loses']}\nГотов — жми «🎯 Вернуть фокус».",
+        reply_markup=main_menu_kb()
+    )
+    await update_last_tag(call.message.chat.id, uid, "menu")
+    await call.answer()
+
+# ---------- Timers callbacks ----------
 @dp.callback_query(F.data == "menu:timer")
 async def cb_menu_timer(call: types.CallbackQuery):
     try:
@@ -528,32 +688,30 @@ async def cb_timer(call: types.CallbackQuery, state: FSMContext):
     if data == "timer:custom":
         await state.set_state(TimerStates.waiting_minutes)
         try:
-            await call.message.edit_text(
-                "Введи число минут (1–180):",
-                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                    [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:timer")]
-                ])
-            )
+            await call.message.edit_text("Введи число минут (1–180):",
+                                         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                                             [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:timer")]
+                                         ]))
             await update_last_tag(chat_id, uid, "menu")
         except Exception:
             await send_clean(chat_id, uid, "Введи число минут (1–180):",
                              reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
                                  [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:timer")]
                              ]), tag="menu", preserve_tags={"timer"})
-        await call.answer()
-        return
+        await call.answer(); return
 
     if data == "timer:again":
         minutes = timer_meta.get(uid, (None, 15))[1]
+    elif data == "timer:pomodoro":
+        asyncio.create_task(schedule_pomodoro(chat_id, uid))
+        await call.answer("Помидор 25/5 запущен"); return
     else:
         minutes = int(data.split(":")[1])
 
     await start_timer(chat_id, uid, minutes)
-    # Публикуем отдельное таймерное сообщение (tag="timer"), чтобы его не удалило меню
     try:
         m = await bot.send_message(
-            chat_id,
-            f"✅ Таймер включён на {minutes} мин.",
+            chat_id, f"✅ Таймер включён на {minutes} мин.",
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="⏹ Остановить", callback_data="timer:stop")],
                 [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
@@ -561,7 +719,6 @@ async def cb_timer(call: types.CallbackQuery, state: FSMContext):
         )
         LAST_BOT_MSG[(chat_id, uid)] = (m.message_id, "timer")
     except Exception:
-        # на всякий — через send_clean c тегом timer
         await send_clean(chat_id, uid, f"✅ Таймер включён на {minutes} мин.",
                          reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
                              [types.InlineKeyboardButton(text="⏹ Остановить", callback_data="timer:stop")],
@@ -589,7 +746,7 @@ async def custom_minutes_input(msg: types.Message, state: FSMContext):
         return
     n = int(text)
     if not (1 <= n <= 180):
-        await send_clean(msg.chat.id, msg.from_user.id, "Допустимый диапазон: 1–180 минут. Попробуй снова.",
+        await send_clean(msg.chat.id, msg.from_user.id, "Допустимы 1–180 минут.",
                          reply_markup=main_menu_kb(), tag="menu", preserve_tags={"timer"})
         return
     await state.clear()
@@ -603,64 +760,7 @@ async def custom_minutes_input(msg: types.Message, state: FSMContext):
     )
     LAST_BOT_MSG[(msg.chat.id, msg.from_user.id)] = (m.message_id, "timer")
 
-# ---------- Battle (Вернуть фокус) ----------
-@dp.callback_query(F.data == "battle:start")
-async def cb_battle(call: types.CallbackQuery):
-    uid = call.from_user.id
-    await ensure_user(uid)
-    challenge = random.choice([
-        "Встань и сделай 10 шагов 🚶",
-        "Выпей стакан воды 💧",
-        "Закрой лишнюю вкладку/окно 🗂️",
-        "Сделай 5 приседаний 💪",
-        "Потянись и сделай 5 глубоких вдохов 🌬️",
-    ])
-    text = f"🎯 Вернём фокус!\n\nЧеллендж: {challenge}\nСправишься?"
-    try:
-        await call.message.edit_text(
-            text,
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="✅ Сделал", callback_data="battle:win")],
-                [types.InlineKeyboardButton(text="❌ Пока пропущу", callback_data="battle:lose")],
-            ])
-        )
-        await update_last_tag(call.message.chat.id, uid, "battle")
-    except Exception:
-        await send_clean(call.message.chat.id, uid, text,
-                         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                             [types.InlineKeyboardButton(text="✅ Сделал", callback_data="battle:win")],
-                             [types.InlineKeyboardButton(text="❌ Пока пропущу", callback_data="battle:lose")],
-                         ]), tag="battle", preserve_tags={"timer"})
-    await call.answer()
-
-@dp.callback_query(F.data == "battle:win")
-async def cb_battle_win(call: types.CallbackQuery):
-    uid = call.from_user.id
-    await log_event(uid, "battle_win", 5)
-    s = await fetch_stats(uid)
-    await call.message.edit_text(
-        f"🏆 Отлично! Вернул 5 минут фокуса.\n"
-        f"Побед: {s['wins']} | Сдач: {s['loses']}",
-        reply_markup=main_menu_kb()
-    )
-    await update_last_tag(call.message.chat.id, uid, "menu")
-    await call.answer()
-
-@dp.callback_query(F.data == "battle:lose")
-async def cb_battle_lose(call: types.CallbackQuery):
-    uid = call.from_user.id
-    await log_event(uid, "battle_lose", 0)
-    s = await fetch_stats(uid)
-    await call.message.edit_text(
-        f"😌 Ок, возьмём позже.\n"
-        f"Побед: {s['wins']} | Сдач: {s['loses']}\n\n"
-        "Готов — нажми «🎯 Вернуть фокус».",
-        reply_markup=main_menu_kb()
-    )
-    await update_last_tag(call.message.chat.id, uid, "menu")
-    await call.answer()
-
-# ---------- Free chat ----------
+# ---------- Ask (Помощник) ----------
 @dp.callback_query(F.data == "ask")
 async def cb_ask(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AskStates.waiting_input)
@@ -680,14 +780,12 @@ async def cb_ask(call: types.CallbackQuery, state: FSMContext):
 async def ask_input(msg: types.Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
-    await ensure_user(uid)
-    await log_event(uid, "free_chat")
+    await ensure_user(uid); await log_event(uid, "free_chat"); await track(uid, "free_chat", {})
     try: await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
     except: pass
     prompt = (
-        f"Пользователь просит совет: «{msg.text}».\n"
-        "Ответь как тренер по фокусу: 2–4 фразы, конкретный микро-шаг ≤2 минут. "
-        "Без психологии, только действие и фокус."
+        f"Пользователь просит совет: «{msg.text}». "
+        "Ответь как помощник по фокусу: 2–3 фразы, один конкретный шаг ≤2 минут."
     )
     reply = await ai_reply(uid, prompt, 0.9, 400)
     await send_clean(msg.chat.id, uid, reply, reply_markup=main_menu_kb(),
@@ -696,13 +794,12 @@ async def ask_input(msg: types.Message, state: FSMContext):
 @dp.message(F.text & ~F.text.startswith("/"))
 async def free_chat(msg: types.Message):
     uid = msg.from_user.id
-    await ensure_user(uid)
-    await log_event(uid, "free_chat")
+    await ensure_user(uid); await log_event(uid, "free_chat"); await track(uid, "free_chat", {})
     try: await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
     except: pass
     prompt = (
-        f"Пользователь: «{msg.text}».\n"
-        "Ответь кратко как коуч по фокусу: 2–3 фразы, один понятный микро-шаг ≤2 минут."
+        f"Пользователь: «{msg.text}». "
+        "Дай короткую подсказку (2–3 фразы) и один шаг ≤2 минут."
     )
     reply = await ai_reply(uid, prompt, 0.8, 400)
     await send_clean(msg.chat.id, uid, reply, reply_markup=main_menu_kb(),
@@ -715,15 +812,15 @@ async def _send_digest_to_user(uid: int):
     prompt = (
         f"Сводка дня: победы={s['wins']}, сдачи={s['loses']}, фокус={s['reclaimed']} мин, "
         f"таймеров сегодня={s['today_cnt']} ({s['today_min']} мин), чатов={chats}. "
-        "Сделай 2–3 фразы: тёплая похвала + один конкретный совет на завтра (короткий)."
+        "Сделай 2–3 фразы: тёплая похвала + один конкретный совет на завтра."
     )
     ai = await ai_reply(uid, prompt, 0.8, 280)
     text = (
         "🌙 Вечерний итог\n"
-        f"🏆 Победы/сдачи: {s['wins']} / {s['loses']}\n"
+        f"🏆 Победы/сдачи: {s['wins']}/{s['loses']}\n"
         f"⏳ Минуты фокуса: {s['reclaimed']}\n"
         f"⏰ Таймеров: {s['today_cnt']} ({s['today_min']} мин)\n"
-        f"💬 Сообщений тренеру: {chats}\n\n"
+        f"💬 Сообщений помощнику: {chats}\n\n"
         f"{ai}"
     )
     try:
@@ -736,18 +833,18 @@ async def nightly_digest_loop():
     while True:
         try:
             now = datetime.now(tz)
-            today = date.today().isoformat()
             if now.hour == DIGEST_HOUR:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cur = await db.execute("SELECT user_id, COALESCE(last_digest_date,'') FROM users")
-                    rows = await cur.fetchall()
-                for uid, last_day in rows:
-                    if last_day == today:
-                        continue
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    rows = await con.fetch("SELECT user_id, last_digest_date FROM users")
+                today = date.today()
+                for r in rows:
+                    uid = int(r["user_id"]); last = r["last_digest_date"]
+                    if last == today: continue
                     await _send_digest_to_user(uid)
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE users SET last_digest_date=? WHERE user_id=?", (today, uid))
-                        await db.commit()
+                    pool = await get_pool()
+                    async with pool.acquire() as con:
+                        await con.execute("UPDATE users SET last_digest_date=$1 WHERE user_id=$2", today, uid)
                 await asyncio.sleep(65 * 60)
             else:
                 await asyncio.sleep(5 * 60)
@@ -755,7 +852,7 @@ async def nightly_digest_loop():
             log.warning(f"digest loop err: {e}")
             await asyncio.sleep(60)
 
-# ---------- Healthcheck + Webhook ----------
+# ---------- Webhook server ----------
 async def _health(_req): return web.Response(text="OK")
 
 async def webhook_handler(request: web.Request):
@@ -775,7 +872,7 @@ async def set_webhook():
         log.warning("BASE_URL не задан — webhook не настраивается.")
         return
     url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-    await bot.set_webhook(url, drop_pending_updates=True)
+    await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message","callback_query"])
     log.info(f"🔔 Webhook set: {url}")
 
 async def start_web_server():
@@ -791,12 +888,12 @@ async def start_web_server():
     log.info(f"🌐 Web server started on :{port}")
     await set_webhook()
 
-# ---------- main (keep-alive loop) ----------
+# ---------- main (keep-alive) ----------
 async def main():
     await init_db()
     asyncio.create_task(start_web_server())
     asyncio.create_task(nightly_digest_loop())
-    # держим процесс живым
+    # keep alive
     try:
         while True:
             await asyncio.sleep(3600)

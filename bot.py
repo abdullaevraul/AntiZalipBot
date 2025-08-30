@@ -19,7 +19,8 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction
-from aiogram.filters import Command, Text
+from aiogram.filters import Command
+from aiogram.filters.text import Text
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Update

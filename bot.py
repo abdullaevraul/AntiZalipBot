@@ -20,7 +20,6 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
-from aiogram.filters.text import Text
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Update
@@ -476,35 +475,38 @@ async def ai_status(msg: types.Message):
     )
     await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=menu_kb(), tag="ai")
 
-# ---------- Onboarding (фикc: Text(startswith="ob:")) ----------
-@dp.callback_query(Text(startswith="ob:"))
+# ==== Онбординг ====
+@dp.callback_query(F.data.startswith("ob:"))
 async def cb_onboarding(call: types.CallbackQuery):
-    uid = call.from_user.id
-    var = call.data.split(":")[1]
-    await ensure_user(uid)
-    await set_personal_context(uid, var)
-    await track(uid, "onboarding_click", {"variant": var})
+    step = call.data.split(":")[1]
 
-    replies = {
-        "start":       "Начнём с малого. Выбери простой кусочек и удели ему 5 минут — этого достаточно, чтобы включиться.",
-        "distraction": "Убери телефон с глаз и выключи звук на 15 минут. Одно дело — один отрезок.",
-        "overload":    "Разбей задачу на куски. Возьми один понятный на 15 минут — и начни.",
-        "break":       "Сделай короткий перезапуск: вода, движение, дыхание. Затем 5 минут на лёгкую часть.",
-    }
-    text = replies.get(var, "Опиши в двух фразах, что происходит — дам короткий план.")
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="⏳ 5 мин", callback_data="timer:5"),
-            types.InlineKeyboardButton(text="⏳ 15 мин", callback_data="timer:15"),
-            types.InlineKeyboardButton(text="⏳ 30 мин", callback_data="timer:30"),
-        ],
-        [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await send_clean(call.message.chat.id, uid, text, reply_markup=kb, tag="onboarding_ans")
-    await call.answer()
+    if step == "start":
+        await call.message.edit_text(
+            "👋 Привет! Я AntiZalipBot.\n\n"
+            "Помогаю перестать прокрастинировать и возвращаться к делу.\n\n"
+            "Хочешь посмотреть, что я умею?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Да, покажи 🚀", callback_data="ob:features")],
+                    [InlineKeyboardButton(text="Пропустить", callback_data="menu:main")],
+                ]
+            ),
+        )
+
+    elif step == "features":
+        await call.message.edit_text(
+            "✨ Вот что я умею:\n"
+            "1) ⏱ Таймеры — чтобы сфокусироваться.\n"
+            "2) 🧠 Помощник — можно писать своими словами.\n"
+            "3) 📊 Статистика — видеть прогресс.\n"
+            "4) 💡 Обратная связь — твой опыт помогает улучшать бота.\n\n"
+            "Хочешь попробовать прямо сейчас?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Да, погнали 🚀", callback_data="menu:main")],
+                ]
+            ),
+        )
 
 # ---------- Menu ----------
 @dp.callback_query(F.data == "menu:root")

@@ -1,7 +1,8 @@
 # AntiZalipBot — Render webhook + Supabase + PostHog
-# UX: онбординг, "Начать сейчас", таймеры 5/15/30/свой, пост-таймер опрос,
-# ветка "не удалось -> почему?", помощник (ИИ), обратная связь, чистый чат.
 # Python 3.12, aiogram 3.5
+# UX: онбординг, "Начать сейчас" (переименовано), таймеры, пост-таймер опрос,
+# причины "почему не получилось", помощник (ИИ), обратная связь, чистка чата,
+# сторож вебхука.
 
 import os
 import asyncio
@@ -18,7 +19,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction
-from aiogram.filters import Command
+from aiogram.filters import Command, Text
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Update
@@ -37,14 +38,14 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is missing")
 
-BASE_URL       = os.getenv("BASE_URL")  # https://<service>.onrender.com
+BASE_URL       = os.getenv("BASE_URL")  # https://antizalipbot.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "antizalip_secret")
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 MODEL_NAME      = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase/Neon Session Pooler (…session-pooler…:6543)
+DATABASE_URL = os.getenv("DATABASE_URL")
 POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY")
 POSTHOG_HOST    = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
 
@@ -52,7 +53,7 @@ DIGEST_TZ   = os.getenv("DIGEST_TZ", "Europe/Moscow")
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "22"))
 
 MAX_AI_CALLS_PER_DAY = int(os.getenv("MAX_AI_CALLS_PER_DAY", "30"))
-MAX_DAILY_SPEND      = float(os.getenv("MAX_DAILY_SPEND", "1.0"))  # $/day
+MAX_DAILY_SPEND      = float(os.getenv("MAX_DAILY_SPEND", "1.0"))
 
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
@@ -74,7 +75,7 @@ if OPENAI_API_KEY and AsyncOpenAI:
     except Exception as e:
         log.warning(f"OpenAI init failed: {e}")
 
-# ---------- DB (Supabase) ----------
+# ---------- DB ----------
 DB_POOL: asyncpg.Pool | None = None
 
 async def get_pool() -> asyncpg.Pool:
@@ -82,7 +83,6 @@ async def get_pool() -> asyncpg.Pool:
     if DB_POOL is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is missing")
-        # If you use Transaction Pooler: add statement_cache_size=0
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, max_size=10)
     return DB_POOL
 
@@ -109,7 +109,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS messages(
           id BIGSERIAL PRIMARY KEY,
           user_id BIGINT NOT NULL,
-          kind TEXT NOT NULL,  -- 'free_chat' | 'feedback'
+          kind TEXT NOT NULL,
           text TEXT NOT NULL,
           created_at TIMESTAMPTZ DEFAULT now()
         )""")
@@ -145,12 +145,9 @@ async def store_message(uid: int, kind: str, text: str):
 async def fetch_stats(uid: int) -> dict:
     pool = await get_pool()
     async with pool.acquire() as con:
-        # wins/loses считаем по пост-таймерному ответу
         wins  = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='posttimer_win'", uid) or 0
         loses = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='posttimer_fail'", uid) or 0
-        total_focus = await con.fetchval(
-            "SELECT COALESCE(SUM(value),0) FROM events WHERE user_id=$1 AND event='timer_done'", uid
-        ) or 0
+        total_focus = await con.fetchval("SELECT COALESCE(SUM(value),0) FROM events WHERE user_id=$1 AND event='timer_done'", uid) or 0
         today = await con.fetchrow("""
             SELECT COUNT(*) AS cnt, COALESCE(SUM(value),0) AS minutes
             FROM events
@@ -165,12 +162,7 @@ async def fetch_stats(uid: int) -> dict:
 async def track(uid: int, event: str, props: dict | None = None):
     if not POSTHOG_API_KEY:
         return
-    payload = {
-        "api_key": POSTHOG_API_KEY,
-        "event": event,
-        "distinct_id": str(uid),
-        "properties": props or {},
-    }
+    payload = {"api_key": POSTHOG_API_KEY, "event": event, "distinct_id": str(uid), "properties": props or {}}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(f"{POSTHOG_HOST}/capture/", json=payload)
@@ -185,7 +177,6 @@ SYSTEM_COACH = (
 
 async def ai_generate(prompt: str, temperature: float = 0.8, max_tokens: int = 220) -> str | None:
     if not oa_client:
-        # оффлайн заглушки
         return random.choice([
             "Выбери одну простую часть задачи и удели ей 10–15 минут. Начни с малого — остальное подтянется.",
             "Убери лишнее с глаз, поставь таймер на 15 минут и займись одной вещью. Потом решишь, что дальше.",
@@ -193,20 +184,14 @@ async def ai_generate(prompt: str, temperature: float = 0.8, max_tokens: int = 2
         ])
     try:
         resp = await oa_client.chat.completions.create(
-            model=MODEL_NAME,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": SYSTEM_COACH},
-                {"role": "user", "content": prompt},
-            ],
+            model=MODEL_NAME, temperature=temperature, max_tokens=max_tokens,
+            messages=[{"role":"system","content":SYSTEM_COACH},{"role":"user","content":prompt}],
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         log.warning(f"AI error: {e}")
         return None
 
-# AI лимиты (по желанию — можно отключить)
 async def ai_calls_today(uid: int) -> int:
     pool = await get_pool()
     async with pool.acquire() as con:
@@ -237,7 +222,7 @@ async def can_spend(amount: float) -> bool:
     return (await total_spend_today()) + float(amount) <= MAX_DAILY_SPEND
 
 async def ai_reply(uid: int, prompt: str, temperature=0.8, max_tokens=220) -> str:
-    est_cost = (max_tokens / 1000.0) * 0.0006  # грубая оценка
+    est_cost = (max_tokens / 1000.0) * 0.0006
     if not await can_use_ai(uid) or not await can_spend(est_cost):
         await log_event(uid, "ai_block", 1)
         return (await ai_generate(prompt, temperature, max_tokens)) or "Начни с 10 минут на самом простом шаге."
@@ -247,10 +232,10 @@ async def ai_reply(uid: int, prompt: str, temperature=0.8, max_tokens=220) -> st
     return text or "Сделай маленький шаг 5–10 минут — главное начать."
 
 # ---------- Chat cleanliness ----------
-LAST_BOT_MSG: dict[tuple[int, int], tuple[int, str | None]] = {}  # (chat_id,user_id) -> (msg_id, tag)
-TIMER_MSG_ID: dict[int, int] = {}  # user_id -> message_id (таймерное сообщение, чтобы удалить)
-ACTIVE_TIMERS: dict[int, asyncio.Task] = {}  # user_id -> task
-TIMER_META: dict[int, dict] = {}  # user_id -> {'chat_id':..., 'minutes':...}
+LAST_BOT_MSG: dict[tuple[int, int], tuple[int, str | None]] = {}
+TIMER_MSG_ID: dict[int, int] = {}
+ACTIVE_TIMERS: dict[int, asyncio.Task] = {}
+TIMER_META: dict[int, dict] = {}
 
 async def send_clean(chat_id: int, user_id: int, text: str,
                      reply_markup: types.InlineKeyboardMarkup | None = None,
@@ -400,10 +385,8 @@ async def cancel_user_timer(uid: int):
     if task and not task.done():
         task.cancel()
         await log_event(uid, "timer_cancel")
-    # удалить таймерное сообщение, если висит
     mid = TIMER_MSG_ID.pop(uid, None)
     if mid:
-        # chat_id нам нужен из META
         meta = TIMER_META.get(uid)
         if meta:
             await safe_delete(meta["chat_id"], mid)
@@ -412,11 +395,9 @@ async def timer_worker(uid: int, chat_id: int, minutes: int):
     try:
         await asyncio.sleep(minutes * 60)
         await log_event(uid, "timer_done", minutes)
-        # удалить активное таймерное сообщение
         started_mid = TIMER_MSG_ID.pop(uid, None)
         if started_mid:
             await safe_delete(chat_id, started_mid)
-        # показать опрос результата
         await bot.send_message(
             chat_id,
             f"⏰ {minutes} минут вышло!\nПолучилось сфокусироваться?",
@@ -424,20 +405,15 @@ async def timer_worker(uid: int, chat_id: int, minutes: int):
         )
         await track(uid, "timer_done", {"min": minutes})
     except asyncio.CancelledError:
-        # уже логгер сделали в cancel_user_timer
         pass
 
 async def start_timer(chat_id: int, uid: int, minutes: int):
-    # отменяем предыдущий
     await cancel_user_timer(uid)
-    # запоминаем мету
     TIMER_META[uid] = {"chat_id": chat_id, "minutes": minutes}
-    # запускаем воркер
     task = asyncio.create_task(timer_worker(uid, chat_id, minutes))
     ACTIVE_TIMERS[uid] = task
     await log_event(uid, "timer_start", minutes)
     await track(uid, "timer_start", {"min": minutes})
-    # отправляем таймерное сообщение (которое удалим по завершению/остановке)
     m = await bot.send_message(
         chat_id,
         f"✅ Таймер на {minutes} мин запущен.",
@@ -457,14 +433,12 @@ def fmt_usd(x: float) -> str: return f"${x:.4f}"
 async def cmd_start(msg: types.Message):
     uid = msg.from_user.id
     await ensure_user(uid)
-    # удаляем входящее /start, чтобы не копилось
     try:
         await bot.delete_message(msg.chat.id, msg.message_id)
     except Exception:
         pass
     await log_event(uid, "start")
     await track(uid, "start", {})
-    # показываем онбординг каждый раз по /start
     await send_clean(msg.chat.id, uid, ONBOARDING_TEXT, reply_markup=onboarding_kb(), tag="onboarding")
     await track(uid, "onboarding_view", {})
 
@@ -501,74 +475,8 @@ async def ai_status(msg: types.Message):
     )
     await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=menu_kb(), tag="ai")
 
-@dp.message(Command("db_ping"))
-async def db_ping(msg: types.Message):
-    if not is_admin(msg.from_user.id): return
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            v = await con.fetchval("select version()")
-        await msg.answer("✅ DB OK\n" + (v or "")[:120])
-    except Exception as e:
-        await msg.answer(f"❌ DB FAIL: {e!r}")
-
-@dp.message(Command("adm_webhook"))
-async def adm_webhook(msg: types.Message):
-    if not is_admin(msg.from_user.id): return
-    info = await bot.get_webhook_info()
-    txt = (f"URL: {info.url or '-'}\n"
-           f"Pending: {info.pending_update_count}\n"
-           f"MaxConn: {getattr(info, 'max_connections', 'n/a')}")
-    await msg.answer(txt)
-
-@dp.message(Command("adm_report"))
-async def adm_report(msg: types.Message):
-    if not is_admin(msg.from_user.id): return
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        dau = await con.fetchval("SELECT COUNT(DISTINCT user_id) FROM events WHERE created_at::date=CURRENT_DATE") or 0
-        new = await con.fetchval("SELECT COUNT(*) FROM users WHERE created_at::date=CURRENT_DATE") or 0
-        timers = await con.fetchrow("""
-            SELECT
-              COUNT(*) FILTER (WHERE event='timer_start') AS starts,
-              COUNT(*) FILTER (WHERE event='timer_done')  AS dones,
-              COALESCE(SUM(value) FILTER (WHERE event='timer_done'),0) AS min_done,
-              COUNT(*) FILTER (WHERE event='timer_cancel') AS cancels
-            FROM events WHERE created_at::date=CURRENT_DATE
-        """)
-        post = await con.fetchrow("""
-            SELECT
-              COUNT(*) FILTER (WHERE event='posttimer_win')  AS wins,
-              COUNT(*) FILTER (WHERE event='posttimer_fail') AS fails
-        FROM events WHERE created_at::date=CURRENT_DATE
-        """)
-        ai = await con.fetchrow("""
-            SELECT
-              COUNT(*) FILTER (WHERE event='ai_call') AS calls,
-              COALESCE(SUM(value) FILTER (WHERE event='ai_usd'),0) AS usd
-            FROM events WHERE created_at::date=CURRENT_DATE
-        """)
-        free_chat = await con.fetchval("""
-            SELECT COUNT(*) FROM messages WHERE kind='free_chat' AND created_at::date=CURRENT_DATE
-        """) or 0
-        fb = await con.fetchval("""
-            SELECT COUNT(*) FROM messages WHERE kind='feedback' AND created_at::date=CURRENT_DATE
-        """) or 0
-    timer_cr = (int(timers["dones"] or 0) / max(1, int(timers["starts"] or 0))) * 100
-    dau_avg_focus = (float(timers["min_done"] or 0) / dau) if dau else 0.0
-    text = (
-        "📈 *AntiZalip — отчёт за сегодня*\n"
-        f"👥 DAU: *{dau}* · 🆕 New: *{new}*\n"
-        f"⏱ Таймеры: старт *{int(timers['starts'] or 0)}*, финиш *{int(timers['dones'] or 0)}* "
-        f"(CR *{timer_cr:.0f}%*), отмен *{int(timers['cancels'] or 0)}*, мин *{int(timers['min_done'] or 0)}*\n"
-        f"✅/❌ после таймера: *{int(post['wins'] or 0)}* / *{int(post['fails'] or 0)}*\n"
-        f"🤖 AI: вызовов *{int(ai['calls'] or 0)}* · расход *{fmt_usd(float(ai['usd'] or 0.0))}*\n"
-        f"💬 Чатов: *{free_chat}* · 🗣 Фидбеков: *{fb}* · ⏳ мин/DAU: *{dau_avg_focus:.1f}*"
-    )
-    await msg.answer(text, parse_mode="Markdown")
-
-# ---------- Onboarding ----------
-@dp.callback_query(F.data.startswith("ob:"))
+# ---------- Onboarding (фикc: Text(startswith="ob:")) ----------
+@dp.callback_query(Text(startswith="ob:"))
 async def cb_onboarding(call: types.CallbackQuery):
     uid = call.from_user.id
     var = call.data.split(":")[1]
@@ -583,7 +491,6 @@ async def cb_onboarding(call: types.CallbackQuery):
         "break":       "Сделай короткий перезапуск: вода, движение, дыхание. Затем 5 минут на лёгкую часть.",
     }
     text = replies.get(var, "Опиши в двух фразах, что происходит — дам короткий план.")
-    # Показать ответ + быстрые таймеры
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [
             types.InlineKeyboardButton(text="⏳ 5 мин", callback_data="timer:5"),
@@ -651,7 +558,6 @@ async def feedback_input(msg: types.Message, state: FSMContext):
     await store_message(uid, "feedback", (msg.text or "")[:4000])
     await log_event(uid, "feedback", 1)
     await track(uid, "feedback", {})
-    # опционально — переслать админам
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, f"🗣 Feedback от {uid}:\n{msg.text}")
@@ -671,7 +577,6 @@ async def cb_startnow(call: types.CallbackQuery):
     if ctx in CONTEXT_HINTS:
         pool += CONTEXT_HINTS[ctx]
     phrase = random.choice(pool)
-    # показываем фразу + быстрые таймеры
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [
             types.InlineKeyboardButton(text="⏳ 5 мин", callback_data="timer:5"),
@@ -724,10 +629,8 @@ async def cb_timer(call: types.CallbackQuery, state: FSMContext):
         await send_clean(chat_id, uid, "⛔️ Таймер остановлен.", reply_markup=menu_kb(), tag="menu")
         await call.answer(); return
 
-    # preset
     minutes = int(data.split(":")[1])
     await start_timer(chat_id, uid, minutes)
-    # ничего не чистим — таймерное сообщение удалится по завершению/остановке
     await call.answer()
 
 @dp.message(TimerStates.waiting_minutes, F.text)
@@ -761,7 +664,6 @@ async def cb_posttimer(call: types.CallbackQuery):
             await send_clean(call.message.chat.id, uid, text, reply_markup=menu_kb(), tag="menu")
         await call.answer(); return
 
-    # fail
     await log_event(uid, "posttimer_fail", minutes)
     ask = "Почему не получилось сфокусироваться?"
     try:
@@ -788,22 +690,15 @@ async def cb_reason(call: types.CallbackQuery):
                    "А затем уделим 10 минут этому делу."),
         "other":  ("Опиши своими словами, что мешает — подскажу решение."),
     }
-    timers = {
-        "notify": 15,
-        "hard": 5,
-        "tired": 5,
-        "urgent": 10,
-    }
+    timers = {"notify":15, "hard":5, "tired":5, "urgent":10}
     text = replies.get(code, "Опиши своими словами, что мешает — подскажу решение.")
     if code == "other":
-        # отправляем в помощник
         try:
             await call.message.edit_text(text, reply_markup=menu_kb())
         except Exception:
             await send_clean(call.message.chat.id, uid, text, reply_markup=menu_kb(), tag="ask_hint")
         await call.answer(); return
 
-    # показать совет + кнопка стартовать таймер
     minutes = timers[code]
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text=f"⏳ {minutes} мин", callback_data=f"timer:{minutes}")],
@@ -836,18 +731,15 @@ async def ask_input(msg: types.Message, state: FSMContext):
     await store_message(uid, "free_chat", text)
     await log_event(uid, "free_chat", 1)
     await track(uid, "free_chat_text", {"len": len(text)})
-
     try:
         await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
     except Exception:
         pass
-
     ctx = (await get_personal_context(uid)) or ""
     prompt = f"Контекст: {ctx}. Пользователь: «{text}». Дай короткий план (2–3 фразы) и один шаг на 5–15 минут."
     reply = await ai_reply(uid, prompt, 0.9, 300)
     await send_clean(msg.chat.id, uid, reply, reply_markup=menu_kb(), tag="coach")
 
-# Свободный ввод вне состояний — тоже «Помощник»
 @dp.message(F.text & ~F.text.startswith("/"))
 async def free_chat(msg: types.Message):
     uid = msg.from_user.id
@@ -901,7 +793,23 @@ async def start_web_server():
     log.info(f"🌐 Web server started on :{port}")
     await set_webhook()
 
-# ---------- Nightly digest (опционально, можно оставить) ----------
+# ---------- Webhook watchdog ----------
+async def webhook_watchdog():
+    if not BASE_URL:
+        return
+    want_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            current = info.url or ""
+            if current != want_url:
+                await bot.set_webhook(want_url, drop_pending_updates=False, allowed_updates=["message","callback_query"])
+                log.warning(f"🔁 Webhook re-set to {want_url} (was: {current or 'EMPTY'})")
+        except Exception as e:
+            log.warning(f"webhook_watchdog err: {e}")
+        await asyncio.sleep(600)
+
+# ---------- Nightly digest (optional) ----------
 async def nightly_digest_loop():
     tz = ZoneInfo(DIGEST_TZ)
     while True:
@@ -915,7 +823,6 @@ async def nightly_digest_loop():
                 for r in rows:
                     uid = int(r["user_id"]); last = r["last_digest_date"]
                     if last == today: continue
-                    # простая сводка
                     s = await fetch_stats(uid)
                     text = (
                         "🌙 Вечерний итог\n"
@@ -944,7 +851,7 @@ async def main():
     await init_db()
     log.info("✅ DB init complete")
 
-    # Регистрируем команды (убирает плашку в Telegram)
+    # Команды бота (убирает плашку и даёт «Меню»)
     await bot.set_my_commands([
         types.BotCommand(command="start", description="Перезапуск / онбординг"),
         types.BotCommand(command="menu",  description="Главное меню"),
@@ -952,14 +859,12 @@ async def main():
         types.BotCommand(command="help",  description="Польза и функции"),
     ])
 
-    # Запускаем веб-сервер (webhook) и фоновые задачи
     asyncio.create_task(start_web_server())
     asyncio.create_task(nightly_digest_loop())
+    asyncio.create_task(webhook_watchdog())
 
-    # Держим процесс живым
     while True:
         await asyncio.sleep(3600)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

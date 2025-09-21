@@ -1,4 +1,4 @@
-aiogram==3.*
+aiogram>=3.7,<3.8
 aiohttp>=3.9
 asyncpg>=0.29
 httpx>=0.28

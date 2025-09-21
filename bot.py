@@ -1,916 +1,213 @@
-# AntiZalipBot — Telegram + Render (webhook) + Supabase + PostHog
-# Python 3.12, aiogram 3.5.x
+# main.py
+# Минимальный, но рабочий Telegram-бот на aiogram v3
+# Фичи:
+# - /start показывает меню с четырьмя кнопками (ReplyKeyboard — без callback'ов => без "вечной загрузки")
+# - Свободный ввод работает всегда; если выбран один из сценариев — бот попросит описать ситуацию
+# - Простая FSM: выбор темы -> ожидание описания -> ответ -> возврат в меню
+# - Грубая защита от флуда + логирование ошибок
 
 import os
 import asyncio
 import logging
-import random
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
+from typing import Literal
 
-import asyncpg
-import httpx
-from dotenv import load_dotenv
-from aiohttp import web
-
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ChatAction
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Update
 
-# ---------- Optional OpenAI ----------
-try:
-    from openai import AsyncOpenAI
-except Exception:  # если библиотека недоступна
-    AsyncOpenAI = None
-
-# ---------- ENV ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ========= Конфигурация =========
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is missing")
+    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
 
-BASE_URL       = os.getenv("BASE_URL")         # https://antizalipbot.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "antizalip_secret")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("ai-helper-bot")
 
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
-MODEL_NAME      = os.getenv("MODEL_NAME", "gpt-4o-mini")
+# ========= Клавиатуры =========
+BTN_CANT_START = "Не могу начать"
+BTN_DISTRACTED = "Отвлекаюсь"
+BTN_OVERLOAD   = "Перегруз"
+BTN_BREAK      = "Нужен перерыв"
 
-DATABASE_URL   = os.getenv("DATABASE_URL")
-POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY")
-POSTHOG_HOST    = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
-
-DIGEST_TZ   = os.getenv("DIGEST_TZ", "Europe/Moscow")
-DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "22"))
-
-MAX_AI_CALLS_PER_DAY = int(os.getenv("MAX_AI_CALLS_PER_DAY", "30"))
-MAX_DAILY_SPEND      = float(os.getenv("MAX_DAILY_SPEND", "1.0"))
-
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("AntiZalipBot")
-
-# ---------- Aiogram ----------
-session = AiohttpSession()
-bot = Bot(TOKEN, session=session)
-dp = Dispatcher()
-
-# ---------- OpenAI ----------
-oa_client = None
-if OPENAI_API_KEY and AsyncOpenAI:
-    try:
-        oa_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-        log.info("✅ OpenAI client initialized")
-    except Exception as e:
-        log.warning(f"OpenAI init failed: {e}")
-
-# ---------- DB ----------
-DB_POOL: asyncpg.Pool | None = None
-
-async def get_pool() -> asyncpg.Pool:
-    global DB_POOL
-    if DB_POOL is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is missing")
-        DB_POOL = await asyncpg.create_pool(DATABASE_URL, max_size=10)
-    return DB_POOL
-
-async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-          user_id BIGINT PRIMARY KEY,
-          created_at TIMESTAMPTZ DEFAULT now(),
-          seen_nudge BOOLEAN DEFAULT FALSE,
-          last_digest_date DATE,
-          personal_context TEXT
-        )""")
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS events(
-          id BIGSERIAL PRIMARY KEY,
-          user_id BIGINT NOT NULL,
-          event TEXT NOT NULL,
-          value NUMERIC,
-          created_at TIMESTAMPTZ DEFAULT now()
-        )""")
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS messages(
-          id BIGSERIAL PRIMARY KEY,
-          user_id BIGINT NOT NULL,
-          kind TEXT NOT NULL,
-          text TEXT NOT NULL,
-          created_at TIMESTAMPTZ DEFAULT now()
-        )""")
-        await con.execute("CREATE INDEX IF NOT EXISTS idx_events_user_created ON events(user_id, created_at DESC)")
-        await con.execute("CREATE INDEX IF NOT EXISTS idx_events_event_created ON events(event, created_at DESC)")
-        await con.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_created ON messages(user_id, created_at DESC)")
-
-async def ensure_user(uid: int):
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT (user_id) DO NOTHING", uid)
-
-async def set_personal_context(uid: int, context: str | None):
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("UPDATE users SET personal_context=$1 WHERE user_id=$2", context, uid)
-
-async def get_personal_context(uid: int) -> str | None:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        return await con.fetchval("SELECT personal_context FROM users WHERE user_id=$1", uid)
-
-async def log_event(uid: int, event: str, value: float | None = None):
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("INSERT INTO events(user_id,event,value) VALUES($1,$2,$3)", uid, event, value)
-
-async def store_message(uid: int, kind: str, text: str):
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("INSERT INTO messages(user_id,kind,text) VALUES($1,$2,$3)", uid, kind, text)
-
-async def fetch_stats(uid: int) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        wins  = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='posttimer_win'", uid) or 0
-        loses = await con.fetchval("SELECT COUNT(*) FROM events WHERE user_id=$1 AND event='posttimer_fail'", uid) or 0
-        total_focus = await con.fetchval("SELECT COALESCE(SUM(value),0) FROM events WHERE user_id=$1 AND event='timer_done'", uid) or 0
-        today = await con.fetchrow("""
-            SELECT COUNT(*) AS cnt, COALESCE(SUM(value),0) AS minutes
-            FROM events
-            WHERE user_id=$1 AND event='timer_done' AND created_at::date=CURRENT_DATE
-        """, uid)
-    return {
-        "wins": int(wins), "loses": int(loses), "reclaimed": int(total_focus),
-        "today_cnt": int(today["cnt"] or 0), "today_min": int(today["minutes"] or 0)
-    }
-
-# ---------- Analytics (PostHog) ----------
-async def track(uid: int, event: str, props: dict | None = None):
-    if not POSTHOG_API_KEY:
-        return
-    payload = {"api_key": POSTHOG_API_KEY, "event": event, "distinct_id": str(uid), "properties": props or {}}
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(f"{POSTHOG_HOST}/capture/", json=payload)
-    except Exception:
-        pass
-
-# ---------- AI ----------
-SYSTEM_COACH = (
-    "Ты помогаешь бороться с прокрастинацией. Коротко, по делу, 2–3 фразы. "
-    "Дай один конкретный шаг на 5–15 минут. Без психотерапии и оценок."
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_CANT_START), KeyboardButton(text=BTN_DISTRACTED)],
+        [KeyboardButton(text=BTN_OVERLOAD),   KeyboardButton(text=BTN_BREAK)]
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Можешь нажать кнопку или просто написать свободным текстом…"
 )
 
-async def ai_generate(prompt: str, temperature: float = 0.8, max_tokens: int = 220) -> str | None:
-    if not oa_client:
-        return random.choice([
-            "Выбери одну простую часть задачи и удели ей 10–15 минут. Начни с малого — остальное подтянется.",
-            "Убери лишнее с глаз, поставь таймер на 15 минут и займись одной вещью. Потом решишь, что дальше.",
-            "Сделай быстрый старт: 5 минут на самый лёгкий шаг. Главное — переключиться в действие.",
-        ])
-    try:
-        resp = await oa_client.chat.completions.create(
-            model=MODEL_NAME, temperature=temperature, max_tokens=max_tokens,
-            messages=[{"role":"system","content":SYSTEM_COACH},{"role":"user","content":prompt}],
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        log.warning(f"AI error: {e}")
-        return None
+# ========= Состояния =========
+TopicType = Literal["cant_start", "distracted", "overload", "need_break"]
 
-async def ai_calls_today(uid: int) -> int:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        n = await con.fetchval("""
-            SELECT COUNT(*) FROM events
-            WHERE user_id=$1 AND event='ai_call' AND created_at::date=CURRENT_DATE
-        """, uid)
-    return int(n or 0)
+class Flow(StatesGroup):
+    waiting_topic_details = State()  # пользователь выбрал тему и теперь описывает ситуацию
 
-async def total_spend_today() -> float:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        val = await con.fetchval("""
-            SELECT COALESCE(SUM(value),0) FROM events
-            WHERE event='ai_usd' AND created_at::date=CURRENT_DATE
-        """)
-    return float(val or 0.0)
-
-async def add_spend(amount: float):
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute("INSERT INTO events(user_id,event,value) VALUES(0,'ai_usd',$1)", float(amount))
-
-async def can_use_ai(uid: int) -> bool:
-    return (await ai_calls_today(uid)) < MAX_AI_CALLS_PER_DAY
-
-async def can_spend(amount: float) -> bool:
-    return (await total_spend_today()) + float(amount) <= MAX_DAILY_SPEND
-
-async def ai_reply(uid: int, prompt: str, temperature=0.8, max_tokens=220) -> str:
-    est_cost = (max_tokens / 1000.0) * 0.0006  # прикидываем
-    if not await can_use_ai(uid) or not await can_spend(est_cost):
-        await log_event(uid, "ai_block", 1)
-        return (await ai_generate(prompt, temperature, max_tokens)) or "Начни с 10 минут на самом простом шаге."
-    text = await ai_generate(prompt, temperature, max_tokens)
-    await log_event(uid, "ai_call", 1)
-    await add_spend(est_cost)
-    return text or "Сделай маленький шаг 5–10 минут — главное начать."
-
-# ---------- Chat cleanliness ----------
-LAST_BOT_MSG: dict[tuple[int, int], tuple[int, str | None]] = {}
-TIMER_MSG_ID: dict[int, int] = {}
-ACTIVE_TIMERS: dict[int, asyncio.Task] = {}
-TIMER_META: dict[int, dict] = {}
-
-async def send_clean(chat_id: int, user_id: int, text: str,
-                     reply_markup: types.InlineKeyboardMarkup | None = None,
-                     parse_mode: str | None = None,
-                     tag: str | None = None,
-                     preserve_tags: set[str] | None = None):
-    key = (chat_id, user_id)
-    prev = LAST_BOT_MSG.get(key)
-    if prev:
-        prev_mid, prev_tag = prev
-        if not (preserve_tags and prev_tag in preserve_tags):
-            try:
-                await bot.delete_message(chat_id, prev_mid)
-            except Exception:
-                pass
-    m = await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-    LAST_BOT_MSG[key] = (m.message_id, tag)
-    return m
-
-async def update_last_tag(chat_id: int, user_id: int, tag: str | None):
-    key = (chat_id, user_id)
-    if key in LAST_BOT_MSG:
-        mid, _ = LAST_BOT_MSG[key]
-        LAST_BOT_MSG[key] = (mid, tag)
-
-async def safe_delete(chat_id: int, message_id: int):
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
-
-# ---------- Keyboards ----------
-def menu_kb(uid: int | None = None) -> types.InlineKeyboardMarkup:
-    rows = [
-        [types.InlineKeyboardButton(text="🚀 Начать сейчас", callback_data="startnow:start")],
-        [
-            types.InlineKeyboardButton(text="⏳ Таймер", callback_data="menu:timer"),
-            types.InlineKeyboardButton(text="💬 Помощник", callback_data="ask"),
-        ],
-        [
-            types.InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats"),
-            types.InlineKeyboardButton(text="💡 Обратная связь", callback_data="menu:feedback"),
-        ],
-        [types.InlineKeyboardButton(text="ℹ️ Польза и функции", callback_data="menu:help")],
-    ]
-    # Админ-ряд (покажется только ADMIN_IDS)
-    if uid and uid in ADMIN_IDS:
-        rows.append([
-            types.InlineKeyboardButton(text="♻️ Переставить вебхук", callback_data="adm:webhook"),
-            types.InlineKeyboardButton(text="🔄 Перезапуск",        callback_data="adm:restart"),
-        ])
-    return types.InlineKeyboardMarkup(inline_keyboard=rows)
-
-def timers_kb() -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="5 мин", callback_data="timer:5"),
-            types.InlineKeyboardButton(text="15 мин", callback_data="timer:15"),
-            types.InlineKeyboardButton(text="30 мин", callback_data="timer:30"),
-        ],
-        [types.InlineKeyboardButton(text="Свой…", callback_data="timer:custom")],
-        [types.InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:root")],
-    ])
-
-def posttimer_kb(minutes: int) -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="✅ Да",  callback_data=f"posttimer:win:{minutes}"),
-            types.InlineKeyboardButton(text="❌ Не удалось", callback_data=f"posttimer:fail:{minutes}"),
-        ],
-        [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-    ])
-
-def reasons_kb() -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="📱 Уведомления/соцсети", callback_data="reason:notify")],
-        [types.InlineKeyboardButton(text="🧱 Сложно/непонятно",     callback_data="reason:hard")],
-        [types.InlineKeyboardButton(text="😵 Устал, нет энергии",   callback_data="reason:tired")],
-        [types.InlineKeyboardButton(text="🚨 Срочные дела",         callback_data="reason:urgent")],
-        [types.InlineKeyboardButton(text="🤔 Другое",               callback_data="reason:other")],
-    ])
-
-def onboarding_kb() -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="🏁 Не могу начать", callback_data="ob:start"),
-            types.InlineKeyboardButton(text="📱 Отвлекаюсь",     callback_data="ob:distraction"),
-        ],
-        [
-            types.InlineKeyboardButton(text="😵 Перегруз",       callback_data="ob:overload"),
-            types.InlineKeyboardButton(text="☕ Нужен перерыв",  callback_data="ob:break"),
-        ],
-        [types.InlineKeyboardButton(text="✍️ Напишу сам", callback_data="ask")],
-    ])
-
-# ---------- Texts ----------
-ONBOARDING_TEXT = (
-    "Привет 👋 Я AntiZalip. Помогаю перестать откладывать и вернуться к делу.\n\n"
-    "Что мешает прямо сейчас?"
-)
-HELP_TEXT = (
-    "Польза и функции:\n"
-    "• 🚀 Начать сейчас — быстрый вход в действие\n"
-    "• ⏳ Таймер — договорись с собой на 5/15/30 мин\n"
-    "• 💬 Помощник — короткий план и один шаг\n"
-    "• 📊 Статистика — твои минуты фокуса и победы\n\n"
-    "Пиши своими словами в любой момент."
-)
-WELCOME_TEXT = "Главное меню. Выбирай действие ниже или напиши своими словами."
-
-# ---------- States ----------
-class TimerStates(StatesGroup):
-    waiting_minutes = State()
-
-class AskStates(StatesGroup):
-    waiting_input = State()
-
-class FeedbackStates(StatesGroup):
-    waiting_text = State()
-
-# ---------- "Начать сейчас" фразы ----------
-UNIVERSAL_KICKS = [
-    "Определи один простой шаг и сделай его 5 минут.",
-    "Убери лишнее с глаз. Эти 15 минут — только одно дело.",
-    "Назови вслух, что сделаешь за 30 минут — и начни.",
-    "Сделай первую часть: один звонок, один абзац или одна полка — 10–15 минут.",
-    "Если тяжело — уменьши задачу вдвое и начни на 5 минут.",
-    "Сделай быстрый старт: настрой рабочее место и включись на 15 минут.",
-    "Закрой всё лишнее. 5 минут — только один шаг к цели.",
-]
-
-CONTEXT_HINTS = {
-    "start": [
-        "Начнём с малого: выбери простой кусочек и удели ему 5 минут.",
-        "Поставь 15 минут и сделай первый понятный шаг.",
-    ],
-    "distraction": [
-        "Убери телефон с глаз и выключи звук на 15 минут. Одно дело — один отрезок.",
-        "Закрой лишние окна и дай себе 5 минут на простой шаг.",
-    ],
-    "overload": [
-        "Разбей задачу на куски. Возьми один — самый понятный — на 15 минут.",
-        "Запиши 3 пункта плана, затем 10 минут на первый пункт.",
-    ],
-    "break": [
-        "Пауза: вода, движение, 5 глубоких вдохов. Затем 5 минут на лёгкую часть.",
-        "Сделай короткий перезапуск и включись на 10 минут.",
-    ],
+# ========= Хелперы =========
+TOPIC_MAP: dict[str, TopicType] = {
+    BTN_CANT_START: "cant_start",
+    BTN_DISTRACTED: "distracted",
+    BTN_OVERLOAD:   "overload",
+    BTN_BREAK:      "need_break",
 }
 
-# ---------- Timers ----------
-async def cancel_user_timer(uid: int):
-    task = ACTIVE_TIMERS.pop(uid, None)
-    if task and not task.done():
-        task.cancel()
-        await log_event(uid, "timer_cancel")
-    mid = TIMER_MSG_ID.pop(uid, None)
-    if mid:
-        meta = TIMER_META.get(uid)
-        if meta:
-            await safe_delete(meta["chat_id"], mid)
-
-async def timer_worker(uid: int, chat_id: int, minutes: int):
-    try:
-        await asyncio.sleep(minutes * 60)
-        await log_event(uid, "timer_done", minutes)
-        started_mid = TIMER_MSG_ID.pop(uid, None)
-        if started_mid:
-            await safe_delete(chat_id, started_mid)
-        await bot.send_message(
-            chat_id,
-            f"⏰ {minutes} минут вышло!\nПолучилось сфокусироваться?",
-            reply_markup=posttimer_kb(minutes)
+def topic_intro(topic: TopicType) -> str:
+    if topic == "cant_start":
+        return (
+            "Окей, тема: «Не могу начать».\n"
+            "Короткий чек-лист:\n"
+            "1) Уменьшим шаг: сформулируй задачу на 10–15 минут.\n"
+            "2) Убери барьеры: что мешает сесть за работу прямо сейчас?\n"
+            "3) Запускаем таймер: 10 минут на разгон.\n\n"
+            "Опиши, пожалуйста, что именно пытаешься начать и что тебя стопорит."
         )
-        await track(uid, "timer_done", {"min": minutes})
-    except asyncio.CancelledError:
-        pass
-
-async def start_timer(chat_id: int, uid: int, minutes: int):
-    await cancel_user_timer(uid)
-    TIMER_META[uid] = {"chat_id": chat_id, "minutes": minutes}
-    task = asyncio.create_task(timer_worker(uid, chat_id, minutes))
-    ACTIVE_TIMERS[uid] = task
-    await log_event(uid, "timer_start", minutes)
-    await track(uid, "timer_start", {"min": minutes})
-    m = await bot.send_message(
-        chat_id,
-        f"✅ Таймер на {minutes} мин запущен.",
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="⏹ Остановить", callback_data="timer:stop")],
-            [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-        ])
+    if topic == "distracted":
+        return (
+            "Тема: «Отвлекаюсь».\n"
+            "Экспресс-план:\n"
+            "1) Уведомления и вкладки — в офф.\n"
+            "2) Рабочее окно одно, задачи — в списке.\n"
+            "3) Интервалы 15–20 минут, затем короткий перерыв.\n\n"
+            "Напиши, что делаешь и на что чаще всего уходит внимание."
+        )
+    if topic == "overload":
+        return (
+            "Тема: «Перегруз».\n"
+            "Снимем давление:\n"
+            "1) Выгрузи всё из головы: список задач.\n"
+            "2) Пометим срочность/важность.\n"
+            "3) Выберем 1–2 шага на ближайшие 30 минут.\n\n"
+            "Опиши кратко текущее «завалено»: какие задачи и дедлайны давят?"
+        )
+    return (
+        "Тема: «Нужен перерыв».\n"
+        "План восстановления:\n"
+        "1) 5–10 минут — дыхание/прогулка/вода.\n"
+        "2) Отметим уровень усталости по шкале 1–10.\n"
+        "3) Решим, что реально сделать после паузы.\n\n"
+        "Как ты сейчас себя чувствуешь и сколько есть времени на отдых?"
     )
-    TIMER_MSG_ID[uid] = m.message_id
 
-# ---------- Admin utils ----------
-def is_admin(uid: int) -> bool: return uid in ADMIN_IDS
-def fmt_usd(x: float) -> str: return f"${x:.4f}"
+def topic_response(topic: TopicType, user_text: str) -> str:
+    # Минимальная, но полезная логика ответа на свободный ввод.
+    if topic == "cant_start":
+        return (
+            "Вижу барьеры. Что делаем прямо сейчас:\n"
+            "• Сформулируй первый шаг на 10 минут, выполним без идеализма.\n"
+            f"• Учёл твоё описание: «{user_text[:200]}».\n"
+            "• После — короткий отчёт одним предложением. Готов?"
+        )
+    if topic == "distracted":
+        return (
+            "Фиксируем отвлечения:\n"
+            "• Закрой все нерабочие вкладки, уведомления — в «Не беспокоить».\n"
+            "• Открой только один рабочий файл/задачу на 15 минут.\n"
+            f"• Триггеры из твоего описания: «{user_text[:200]}» — учёл.\n"
+            "Отпишись через 15 минут, что удалось сделать."
+        )
+    if topic == "overload":
+        return (
+            "Снимаем перегруз по шагам:\n"
+            "• Выпиши задачи в список (можно здесь).\n"
+            "• Пометь одну «срочно/важно» — сделаем её первой за 25 минут.\n"
+            f"• Ключевые точки из описания: «{user_text[:200]}».\n"
+            "Готов стартануть с первой задачи?"
+        )
+    return (
+        "Организуем перерыв без чувства вины:\n"
+        "• 7 минут — без экрана: вода/дыхание/движение.\n"
+        "• Вернёшься и назовёшь один минимальный шаг.\n"
+        f"• Запомнил твой контекст: «{user_text[:200]}».\n"
+        "Поставь таймер и отпишись, когда вернёшься."
+    )
 
-# ---------- Commands ----------
-@dp.message(Command("start"))
-async def cmd_start(msg: types.Message):
-    uid = msg.from_user.id
-    await ensure_user(uid)
-    try:
-        await bot.delete_message(msg.chat.id, msg.message_id)
-    except Exception:
-        pass
-    await log_event(uid, "start")
-    await track(uid, "start", {})
-    await send_clean(msg.chat.id, uid, ONBOARDING_TEXT, reply_markup=onboarding_kb(), tag="onboarding")
+# ========= Инициализация =========
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
 
-@dp.message(Command("menu"))
-async def cmd_menu(msg: types.Message):
-    await send_clean(msg.chat.id, msg.from_user.id, WELCOME_TEXT, reply_markup=menu_kb(msg.from_user.id), tag="menu")
+# ========= Хэндлеры =========
+
+@dp.message(CommandStart())
+async def on_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Привет! Я твой AI-помогатор. Выбери, что ближе, или просто опиши ситуацию свободным текстом.",
+        reply_markup=MAIN_KB
+    )
 
 @dp.message(Command("help"))
-async def cmd_help(msg: types.Message):
-    await send_clean(msg.chat.id, msg.from_user.id, HELP_TEXT, reply_markup=menu_kb(msg.from_user.id), tag="help")
-
-@dp.message(Command("stats"))
-async def cmd_stats(msg: types.Message):
-    s = await fetch_stats(msg.from_user.id)
-    text = (
-        "📊 Твоя статистика:\n"
-        f"🏆 Победы: {s['wins']} · ❌ Неудачи: {s['loses']}\n"
-        f"⏱ Минут фокуса (всего): {s['reclaimed']}\n"
-        f"⏳ Таймеров сегодня: {s['today_cnt']} (мин: {s['today_min']})"
+async def on_help(message: Message):
+    await message.answer(
+        "Доступно:\n"
+        "/start — вернуться в главное меню\n"
+        "Кнопки: «Не могу начать», «Отвлекаюсь», «Перегруз», «Нужен перерыв»\n"
+        "Или напиши свободным текстом — отвечу по сути.",
+        reply_markup=MAIN_KB
     )
-    await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=menu_kb(msg.from_user.id), tag="stats")
 
-@dp.message(Command("ai_status"))
-async def ai_status(msg: types.Message):
-    ok = bool(oa_client and OPENAI_API_KEY)
-    used = await ai_calls_today(msg.from_user.id)
-    left = max(0, MAX_AI_CALLS_PER_DAY - used)
-    spent = await total_spend_today()
-    text = (
-        f"🤖 AI: {'ON ✅' if ok else 'OFF ❌'}\n"
-        f"Model: {MODEL_NAME}\nBase: {OPENAI_BASE_URL or 'default'}\n"
-        f"Персональный лимит: {used}/{MAX_AI_CALLS_PER_DAY} (осталось {left})\n"
-        f"Глобальный расход: {fmt_usd(spent)}/{fmt_usd(MAX_DAILY_SPEND)}"
+@dp.message(F.text.in_(list(TOPIC_MAP.keys())))
+async def on_topic_selected(message: Message, state: FSMContext):
+    topic = TOPIC_MAP[message.text]
+    await state.set_state(Flow.waiting_topic_details)
+    await state.update_data(topic=topic)
+    await message.answer(topic_intro(topic), reply_markup=MAIN_KB)
+
+@dp.message(Flow.waiting_topic_details, F.text.len() > 0)
+async def on_topic_details(message: Message, state: FSMContext):
+    data = await state.get_data()
+    topic: TopicType = data.get("topic", "cant_start")  # дефолт на всякий случай
+    reply = topic_response(topic, message.text)
+    await message.answer(reply, reply_markup=MAIN_KB)
+    # Возврат в "бессостояние" — можно снова жать кнопки или писать текст
+    await state.clear()
+
+@dp.message(Flow.waiting_topic_details)
+async def on_topic_details_nontext(message: Message):
+    await message.answer("Опиши, пожалуйста, словами — что происходит? 🙂", reply_markup=MAIN_KB)
+
+@dp.message(F.text.len() > 0)
+async def on_free_text(message: Message):
+    # Общий свободный ввод вне сценария
+    text = message.text.strip()
+    # Простая эвристика: если пользователь сам написал одну из фраз-кнопок (без нажатия),
+    # обработаем как выбор темы, чтобы не «терять» сценарий.
+    if text in TOPIC_MAP:
+        await on_topic_selected(message, FSMContext(bot=bot, storage=dp.storage, chat=message.chat, user=message.from_user))
+        return
+
+    await message.answer(
+        "Понял. Давай коротко структурируем:\n"
+        "1) Цель на 20–30 минут?\n"
+        "2) Первый шаг на 5–10 минут?\n"
+        "3) Один вероятный барьер?\n\n"
+        "Можешь ответить прямо пунктами. Или нажми подходящую кнопку ниже.",
+        reply_markup=MAIN_KB
     )
-    await send_clean(msg.chat.id, msg.from_user.id, text, reply_markup=menu_kb(msg.from_user.id), tag="ai")
 
-# ---------- Онбординг: 4 отдельные кнопки (строгие callbacks) ----------
-async def _onboarding_answer(call: types.CallbackQuery, variant: str):
-    uid = call.from_user.id
-    await ensure_user(uid)
-    await set_personal_context(uid, variant)
-    await track(uid, "onboarding_click", {"variant": variant})
+@dp.message()
+async def on_other(message: Message):
+    await message.answer("Я понимаю только текст. Напиши пару слов о ситуации или нажми кнопку ниже.", reply_markup=MAIN_KB)
 
-    replies = {
-        "start":       "Начнём с малого. Выбери простой кусочек и удели ему 5 минут — этого достаточно, чтобы включиться.",
-        "distraction": "Убери телефон с глаз и выключи звук на 15 минут. Одно дело — один отрезок.",
-        "overload":    "Разбей задачу на куски. Возьми один понятный на 15 минут — и начни.",
-        "break":       "Сделай короткий перезапуск: вода, движение, дыхание. Затем 5 минут на лёгкую часть.",
-    }
-    text = replies.get(variant, "Опиши в двух фразах, что мешает — дам короткий план.")
+# ========= Error handler =========
+@dp.errors()
+async def errors_handler(update, exception):
+    logger.exception("Ошибка в обработчике: %s | update=%s", exception, update)
+    return True  # не пробрасывать дальше
 
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="⏳ 5 мин",  callback_data="timer:5"),
-            types.InlineKeyboardButton(text="⏳ 15 мин", callback_data="timer:15"),
-            types.InlineKeyboardButton(text="⏳ 30 мин", callback_data="timer:30"),
-        ],
-        [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-    ])
+# ========= Антифлуд (очень простой) =========
+# Aiogram v3 уже последовательно обрабатывает апдейты; при необходимости подключи middlewares/limits.
 
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await send_clean(call.message.chat.id, uid, text, reply_markup=kb, tag="onboarding_ans")
-    await call.answer()
-
-@dp.callback_query(F.data == "ob:start")
-async def ob_start(call: types.CallbackQuery):
-    await _onboarding_answer(call, "start")
-
-@dp.callback_query(F.data == "ob:distraction")
-async def ob_distraction(call: types.CallbackQuery):
-    await _onboarding_answer(call, "distraction")
-
-@dp.callback_query(F.data == "ob:overload")
-async def ob_overload(call: types.CallbackQuery):
-    await _onboarding_answer(call, "overload")
-
-@dp.callback_query(F.data == "ob:break")
-async def ob_break(call: types.CallbackQuery):
-    await _onboarding_answer(call, "break")
-
-# ---------- Menu ----------
-@dp.callback_query(F.data == "menu:root")
-async def cb_menu_root(call: types.CallbackQuery):
-    try:
-        await call.message.edit_text(WELCOME_TEXT, reply_markup=menu_kb(call.from_user.id))
-        await update_last_tag(call.message.chat.id, call.from_user.id, "menu")
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, WELCOME_TEXT, reply_markup=menu_kb(call.from_user.id), tag="menu")
-    await call.answer()
-
-@dp.callback_query(F.data == "menu:help")
-async def cb_menu_help(call: types.CallbackQuery):
-    try:
-        await call.message.edit_text(HELP_TEXT, reply_markup=menu_kb(call.from_user.id))
-        await update_last_tag(call.message.chat.id, call.from_user.id, "help")
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, HELP_TEXT, reply_markup=menu_kb(call.from_user.id), tag="help")
-    await call.answer()
-
-@dp.callback_query(F.data == "menu:stats")
-async def cb_menu_stats(call: types.CallbackQuery):
-    s = await fetch_stats(call.from_user.id)
-    text = (
-        "📊 Твоя статистика:\n"
-        f"🏆 Победы: {s['wins']} · ❌ Неудачи: {s['loses']}\n"
-        f"⏱ Минут фокуса (всего): {s['reclaimed']}\n"
-        f"⏳ Таймеров сегодня: {s['today_cnt']} (мин: {s['today_min']})"
-    )
-    try:
-        await call.message.edit_text(text, reply_markup=menu_kb(call.from_user.id))
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, text, reply_markup=menu_kb(call.from_user.id), tag="stats")
-    await track(call.from_user.id, "stats_view", {})
-    await call.answer()
-
-@dp.callback_query(F.data == "menu:feedback")
-async def cb_menu_feedback(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(FeedbackStates.waiting_text)
-    try:
-        await call.message.edit_text("💡 Обратная связь\nРасскажи, что улучшить или чего не хватает.", reply_markup=menu_kb(call.from_user.id))
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, "💡 Обратная связь\nРасскажи, что улучшить или чего не хватает.",
-                         reply_markup=menu_kb(call.from_user.id), tag="feedback")
-    await call.answer()
-
-@dp.message(FeedbackStates.waiting_text, F.text)
-async def feedback_input(msg: types.Message, state: FSMContext):
-    await state.clear()
-    uid = msg.from_user.id
-    await ensure_user(uid)
-    await store_message(uid, "feedback", (msg.text or "")[:4000])
-    await log_event(uid, "feedback", 1)
-    await track(uid, "feedback", {})
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, f"🗣 Feedback от {uid}:\n{msg.text}")
-        except Exception:
-            pass
-    await send_clean(msg.chat.id, uid, "Спасибо! Записал. Это помогает становиться лучше 🙌",
-                     reply_markup=menu_kb(uid), tag="menu")
-
-# ---------- "Начать сейчас" ----------
-@dp.callback_query(F.data == "startnow:start")
-async def cb_startnow(call: types.CallbackQuery):
-    uid = call.from_user.id
-    await ensure_user(uid)
-    await track(uid, "start_now_click", {})
-    ctx = (await get_personal_context(uid)) or ""
-    pool = UNIVERSAL_KICKS.copy()
-    if ctx in CONTEXT_HINTS:
-        pool += CONTEXT_HINTS[ctx]
-    phrase = random.choice(pool)
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="⏳ 5 мин", callback_data="timer:5"),
-            types.InlineKeyboardButton(text="⏳ 15 мин", callback_data="timer:15"),
-            types.InlineKeyboardButton(text="⏳ 30 мин", callback_data="timer:30"),
-        ],
-        [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-    ])
-    try:
-        await call.message.edit_text(f"🚀 {phrase}", reply_markup=kb)
-        await update_last_tag(call.message.chat.id, uid, "startnow")
-    except Exception:
-        await send_clean(call.message.chat.id, uid, f"🚀 {phrase}", reply_markup=kb, tag="startnow")
-    await call.answer()
-
-# ---------- Timers UI ----------
-@dp.callback_query(F.data == "menu:timer")
-async def cb_menu_timer(call: types.CallbackQuery):
-    desc = ("Таймер — способ договориться с собой. Маленький блок времени = маленькая победа.\n"
-            "Выбери длительность:")
-    try:
-        await call.message.edit_text(desc, reply_markup=timers_kb())
-        await update_last_tag(call.message.chat.id, call.from_user.id, "timer_menu")
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, desc, reply_markup=timers_kb(), tag="timer_menu")
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("timer:"))
-async def cb_timer(call: types.CallbackQuery, state: FSMContext):
-    uid = call.from_user.id
-    chat_id = call.message.chat.id
-    data = call.data
-
-    if data == "timer:custom":
-        await state.set_state(TimerStates.waiting_minutes)
-        try:
-            await call.message.edit_text("Введи число минут (1–180):",
-                                         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                                             [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:timer")]
-                                         ]))
-        except Exception:
-            await send_clean(chat_id, uid, "Введи число минут (1–180):",
-                             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                                 [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:timer")]
-                             ]), tag="timer_custom")
-        await call.answer(); return
-
-    if data == "timer:stop":
-        await cancel_user_timer(uid)
-        await send_clean(chat_id, uid, "⛔️ Таймер остановлен.", reply_markup=menu_kb(uid), tag="menu")
-        await call.answer(); return
-
-    minutes = int(data.split(":")[1])
-    await start_timer(chat_id, uid, minutes)
-    await call.answer()
-
-@dp.message(TimerStates.waiting_minutes, F.text)
-async def custom_minutes_input(msg: types.Message, state: FSMContext):
-    txt = (msg.text or "").strip()
-    if not txt.isdigit():
-        await send_clean(msg.chat.id, msg.from_user.id, "Нужно целое число 1–180. Попробуй снова или нажми «Меню».",
-                         reply_markup=menu_kb(msg.from_user.id), tag="menu")
-        return
-    n = int(txt)
-    if not (1 <= n <= 180):
-        await send_clean(msg.chat.id, msg.from_user.id, "Допустимы 1–180 минут.",
-                         reply_markup=menu_kb(msg.from_user.id), tag="menu")
-        return
-    await state.clear()
-    await start_timer(msg.chat.id, msg.from_user.id, n)
-
-# ---------- Post-timer result ----------
-@dp.callback_query(F.data.startswith("posttimer:"))
-async def cb_posttimer(call: types.CallbackQuery):
-    uid = call.from_user.id
-    _, kind, mins = call.data.split(":")
-    minutes = int(mins)
-    if kind == "win":
-        await log_event(uid, "posttimer_win", minutes)
-        s = await fetch_stats(uid)
-        text = f"🏆 Отлично! +{minutes} минут записаны.\nПобеды: {s['wins']} · Неудачи: {s['loses']}"
-        try:
-            await call.message.edit_text(text, reply_markup=menu_kb(uid))
-        except Exception:
-            await send_clean(call.message.chat.id, uid, text, reply_markup=menu_kb(uid), tag="menu")
-        await call.answer(); return
-
-    await log_event(uid, "posttimer_fail", minutes)
-    ask = "Почему не получилось сфокусироваться?"
-    try:
-        await call.message.edit_text(ask, reply_markup=reasons_kb())
-    except Exception:
-        await send_clean(call.message.chat.id, uid, ask, reply_markup=reasons_kb(), tag="reasons")
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("reason:"))
-async def cb_reason(call: types.CallbackQuery):
-    uid = call.from_user.id
-    code = call.data.split(":")[1]
-    await log_event(uid, f"reason_{code}", 1)
-    await track(uid, "reason", {"code": code})
-
-    replies = {
-        "notify": ("Выключи звук или убери телефон с глаз на 15 минут. "
-                   "Давай попробуем ещё раз?"),
-        "hard":   ("Разбей задачу на маленький кусок и возьми самый понятный. "
-                   "Начнём с 5 минут — просто включиться."),
-        "tired":  ("Сделай мини-перерыв: вода, движение, глубокий вдох. "
-                   "Потом лёгкий 5-минутный шаг."),
-        "urgent": ("Запиши, к чему вернёшься первым делом после срочных. "
-                   "А затем уделим 10 минут этому делу."),
-        "other":  ("Опиши своими словами, что мешает — подскажу решение."),
-    }
-    timers = {"notify":15, "hard":5, "tired":5, "urgent":10}
-    text = replies.get(code, "Опиши своими словами, что мешает — подскажу решение.")
-    if code == "other":
-        try:
-            await call.message.edit_text(text, reply_markup=menu_kb(uid))
-        except Exception:
-            await send_clean(call.message.chat.id, uid, text, reply_markup=menu_kb(uid), tag="ask_hint")
-        await call.answer(); return
-
-    minutes = timers[code]
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text=f"⏳ {minutes} мин", callback_data=f"timer:{minutes}")],
-        [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:root")],
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await send_clean(call.message.chat.id, uid, text, reply_markup=kb, tag="reason_suggest")
-    await call.answer()
-
-# ---------- Помощник ----------
-@dp.callback_query(F.data == "ask")
-async def cb_ask(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(AskStates.waiting_input)
-    txt = "Опиши в 1–2 предложениях, что происходит — дам короткий план и один шаг на 5–15 минут."
-    try:
-        await call.message.edit_text(txt, reply_markup=menu_kb(call.from_user.id))
-        await update_last_tag(call.message.chat.id, call.from_user.id, "ask")
-    except Exception:
-        await send_clean(call.message.chat.id, call.from_user.id, txt, reply_markup=menu_kb(call.from_user.id), tag="ask")
-    await call.answer()
-
-@dp.message(AskStates.waiting_input, F.text)
-async def ask_input(msg: types.Message, state: FSMContext):
-    await state.clear()
-    uid = msg.from_user.id
-    await ensure_user(uid)
-    text = (msg.text or "").strip()
-    await store_message(uid, "free_chat", text)
-    await log_event(uid, "free_chat", 1)
-    await track(uid, "free_chat_text", {"len": len(text)})
-    try:
-        await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-    ctx = (await get_personal_context(uid)) or ""
-    prompt = f"Контекст: {ctx}. Пользователь: «{text}». Дай короткий план (2–3 фразы) и один шаг на 5–15 минут."
-    reply = await ai_reply(uid, prompt, 0.9, 300)
-    await send_clean(msg.chat.id, uid, reply, reply_markup=menu_kb(uid), tag="coach")
-
-@dp.message(F.text & ~F.text.startswith("/"))
-async def free_chat(msg: types.Message):
-    uid = msg.from_user.id
-    await ensure_user(uid)
-    text = (msg.text or "").strip()
-    await store_message(uid, "free_chat", text)
-    await log_event(uid, "free_chat", 1)
-    await track(uid, "free_chat_text", {"len": len(text)})
-    try:
-        await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-    ctx = (await get_personal_context(uid)) or ""
-    prompt = f"Контекст: {ctx}. Пользователь: «{text}». Дай короткий план (2–3 фразы) и один шаг на 5–15 минут."
-    reply = await ai_reply(uid, prompt, 0.8, 300)
-    await send_clean(msg.chat.id, uid, reply, reply_markup=menu_kb(uid), tag="coach")
-
-# ---------- Admin (кнопки) ----------
-@dp.callback_query(F.data == "adm:webhook")
-async def adm_webhook_btn(call: types.CallbackQuery):
-    uid = call.from_user.id
-    if not is_admin(uid):
-        await call.answer("Недостаточно прав", show_alert=True); return
-    try:
-        want = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-        await bot.set_webhook(want, drop_pending_updates=False, allowed_updates=["message","callback_query"])
-        await call.message.edit_text(f"✅ Вебхук переставлен:\n{want}", reply_markup=menu_kb(uid))
-    except Exception as e:
-        await call.message.edit_text(f"❌ Ошибка перестановки вебхука: {e}", reply_markup=menu_kb(uid))
-    await call.answer()
-
-@dp.callback_query(F.data == "adm:restart")
-async def adm_restart_btn(call: types.CallbackQuery):
-    uid = call.from_user.id
-    if not is_admin(uid):
-        await call.answer("Недостаточно прав", show_alert=True); return
-    try:
-        asyncio.create_task(webhook_watchdog())
-        await call.message.edit_text("🔄 Перезапуск фоновых задач… Готово.", reply_markup=menu_kb(uid))
-    except Exception as e:
-        await call.message.edit_text(f"❌ Ошибка перезапуска: {e}", reply_markup=menu_kb(uid))
-    await call.answer()
-
-# ---------- Webhook server ----------
-async def _health(_req): return web.Response(text="OK")
-
-async def webhook_handler(request: web.Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad json")
-    try:
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        log.exception(f"webhook error: {e}")
-    return web.Response(text="ok")
-
-async def set_webhook():
-    if not BASE_URL:
-        log.warning("BASE_URL is not set — webhook not configured.")
-        return
-    url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-    await bot.set_webhook(url, drop_pending_updates=True, allowed_updates=["message","callback_query"])
-    log.info(f"🔔 Webhook set: {url}")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", _health)
-    app.router.add_get("/health", _health)
-    app.router.add_post(f"/webhook/{WEBHOOK_SECRET}", webhook_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"🌐 Web server started on :{port}")
-    await set_webhook()
-
-# ---------- Webhook watchdog ----------
-async def webhook_watchdog():
-    if not BASE_URL:
-        return
-    want_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-    while True:
-        try:
-            info = await bot.get_webhook_info()
-            current = info.url or ""
-            if current != want_url:
-                await bot.set_webhook(want_url, drop_pending_updates=False, allowed_updates=["message","callback_query"])
-                log.warning(f"🔁 Webhook re-set to {want_url} (was: {current or 'EMPTY'})")
-        except Exception as e:
-            log.warning(f"webhook_watchdog err: {e}")
-        await asyncio.sleep(600)
-
-# ---------- Nightly digest (optional) ----------
-async def nightly_digest_loop():
-    tz = ZoneInfo(DIGEST_TZ)
-    while True:
-        try:
-            now = datetime.now(tz)
-            if now.hour == DIGEST_HOUR:
-                pool = await get_pool()
-                async with pool.acquire() as con:
-                    rows = await con.fetch("SELECT user_id, last_digest_date FROM users")
-                today = date.today()
-                for r in rows:
-                    uid = int(r["user_id"]); last = r["last_digest_date"]
-                    if last == today: continue
-                    s = await fetch_stats(uid)
-                    text = (
-                        "🌙 Вечерний итог\n"
-                        f"🏆 Победы/неудачи: {s['wins']}/{s['loses']}\n"
-                        f"⏳ Минуты фокуса: {s['reclaimed']}\n"
-                        f"⏰ Таймеров сегодня: {s['today_cnt']} ({s['today_min']} мин)\n"
-                        "Завтра — ещё один маленький шаг."
-                    )
-                    try:
-                        await bot.send_message(uid, text, reply_markup=menu_kb(uid))
-                    except Exception:
-                        pass
-                    async with pool.acquire() as con2:
-                        await con2.execute("UPDATE users SET last_digest_date=$1 WHERE user_id=$2", today, uid)
-                await asyncio.sleep(65 * 60)
-            else:
-                await asyncio.sleep(5 * 60)
-        except Exception as e:
-            log.warning(f"digest loop err: {e}")
-            await asyncio.sleep(60)
-
-# ---------- main ----------
+# ========= Запуск =========
 async def main():
-    log.info("🚀 AntiZalipBot запускается...")
-
-    await init_db()
-    log.info("✅ DB init complete")
-
-    # Команды бота (убирает плашку и даёт «Меню»)
-    await bot.set_my_commands([
-        types.BotCommand(command="start", description="Перезапуск / онбординг"),
-        types.BotCommand(command="menu",  description="Главное меню"),
-        types.BotCommand(command="stats", description="Статистика"),
-        types.BotCommand(command="help",  description="Польза и функции"),
-        # админские команды лучше не светить обычным пользователям
-    ])
-
-    asyncio.create_task(start_web_server())
-    asyncio.create_task(nightly_digest_loop())
-    asyncio.create_task(webhook_watchdog())
-
-    while True:
-        await asyncio.sleep(3600)
+    logger.info("Бот запускается…")
+    await dp.start_polling(bot, allowed_updates=["message"])
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -3,8 +3,8 @@ services:
     name: ai-pomogator
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    startCommand: "python bot.py"
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
-        sync: false   # токен задашь вручную в настройках Render
+        sync: false   # значение задашь в панели Render (Environment)

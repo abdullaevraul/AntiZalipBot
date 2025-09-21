@@ -1,6 +1,4 @@
-# bot.py
-# Минимальный рабочий Telegram-бот на aiogram 3.7+
-# Long polling + удаление активного webhook при старте
+# bot.py — aiogram 3.7+, long polling, автоснос webhook при конфликте
 
 import os
 import asyncio
@@ -14,6 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramConflictError  # <- важно
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not TOKEN:
@@ -42,11 +41,10 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 # ==== FSM ====
 TopicType = Literal["cant_start", "distracted", "overload", "need_break"]
-
 class Flow(StatesGroup):
     waiting_topic_details = State()
 
-TOPIC_MAP: dict[str, TopicType] = {
+TOPIC_MAP = {
     BTN_CANT_START: "cant_start",
     BTN_DISTRACTED: "distracted",
     BTN_OVERLOAD:   "overload",
@@ -56,54 +54,50 @@ TOPIC_MAP: dict[str, TopicType] = {
 def topic_intro(topic: TopicType) -> str:
     if topic == "cant_start":
         return ("Окей, тема: «Не могу начать».\n"
-                "Чек-лист:\n"
-                "1) Уменьшим шаг до 10–15 минут.\n"
+                "1) Сократим шаг до 10–15 минут.\n"
                 "2) Что мешает начать прямо сейчас?\n"
-                "3) Таймер на 10 минут.\n\n"
-                "Опиши, что именно пытаешься начать и что стопорит.")
+                "3) Таймер 10 минут.\n\n"
+                "Опиши, что пытаешься начать и что стопорит.")
     if topic == "distracted":
         return ("Тема: «Отвлекаюсь».\n"
-                "План:\n"
-                "1) Уведомления/вкладки — в офф.\n"
+                "1) Вылечи уведомления/вкладки.\n"
                 "2) Одно рабочее окно.\n"
                 "3) 15–20 минут фокус + короткий перерыв.\n\n"
-                "Напиши, чем занимаешься и что чаще отвлекает.")
+                "Что именно отвлекает?")
     if topic == "overload":
         return ("Тема: «Перегруз».\n"
-                "Снимаем давление:\n"
-                "1) Выпиши задачи (можно сюда).\n"
-                "2) Пометь срочность/важность.\n"
-                "3) Выберем 1 шаг на 25 минут.\n\n"
-                "Опиши, какие задачи и дедлайны давят.")
+                "1) Выгрузи задачи (можно сюда).\n"
+                "2) Отметь срочность/важность.\n"
+                "3) 1 шаг на 25 минут.\n\n"
+                "Что давит сильнее всего?")
     return ("Тема: «Нужен перерыв».\n"
-            "Восстановление:\n"
-            "1) 5–10 минут — дыхание/прогулка/вода.\n"
-            "2) Оцени усталость 1–10.\n"
-            "3) Один реальный шаг после паузы.\n\n"
-            "Как самочувствие и сколько есть времени на отдых?")
+            "1) 5–10 минут — вода/движение/дыхание.\n"
+            "2) Усталость 1–10.\n"
+            "3) Один шаг после паузы.\n\n"
+            "Как самочувствие и сколько времени на отдых?")
 
 def topic_response(topic: TopicType, user_text: str) -> str:
     clip = user_text.strip()[:200]
     if topic == "cant_start":
-        return ("Действуем сейчас:\n"
+        return ("Действуем:\n"
                 "• Первый шаг на 10 минут, без перфекционизма.\n"
-                f"• Учёл твой контекст: «{clip}».\n"
-                "• После — короткий отчёт одним предложением. Готов?")
+                f"• Учёл контекст: «{clip}».\n"
+                "• После — короткий отчёт. Готов?")
     if topic == "distracted":
         return ("Фиксируем отвлечения:\n"
-                "• Закрой нерабочие вкладки, включи «Не беспокоить».\n"
-                "• Оставь одно рабочее окно на 15 минут.\n"
+                "• Закрой лишнее, включи «Не беспокоить».\n"
+                "• Одно рабочее окно на 15 минут.\n"
                 f"• Триггеры: «{clip}» — учёл.\n"
-                "Отпишись через 15 минут, что успел.")
+                "Отпишись через 15 минут.")
     if topic == "overload":
         return ("Снимаем перегруз:\n"
-                "• Выпиши задачи (можно здесь).\n"
-                "• Отметь одну «срочно/важно» — делаем её 25 минут.\n"
+                "• Выпиши задачи.\n"
+                "• Выбери одну «срочно/важно» на 25 минут.\n"
                 f"• Ключевые пункты: «{clip}».\n"
-                "Стартуем с первой?")
+                "Стартуем?")
     return ("Перерыв без чувства вины:\n"
-            "• 7 минут оффлайн: вода/дыхание/движение.\n"
-            "• Вернёшься — назови один минимальный шаг.\n"
+            "• 7 минут оффлайн: вода/движение/дыхание.\n"
+            "• Вернёшься — один минимальный шаг.\n"
             f"• Запомнил контекст: «{clip}».\n"
             "Поставь таймер и вернись.")
 
@@ -161,7 +155,7 @@ async def on_free_text(message: Message, state: FSMContext):
         "Понял. Давай структурируем:\n"
         "1) Цель на 20–30 минут?\n"
         "2) Первый шаг на 5–10 минут?\n"
-        "3) Один вероятный барьер?\n\n"
+        "3) Один барьер?\n\n"
         "Можешь ответить пунктами или нажми кнопку ниже.",
         reply_markup=MAIN_KB
     )
@@ -176,16 +170,34 @@ async def errors_handler(update, exception):
     logger.exception("Ошибка в обработчике: %s | update=%s", exception, update)
     return True
 
-# ==== Старт ====
+# ==== Старт с авто-ретраем при конфликте webhook ====
 async def main():
     logger.info("Бот запускается…")
-    # КРИТИЧЕСКО: убираем webhook, чтобы long polling работал
+    # первичная зачистка
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён, drop_pending_updates=True")
     except Exception as e:
         logger.warning(f"Не удалось удалить webhook: {e!r}")
-    await dp.start_polling(bot, allowed_updates=["message"])
+
+    # бесконечный цикл: если кто-то снова поставит webhook — снесём и продолжим
+    backoff = 1
+    while True:
+        try:
+            await dp.start_polling(bot, allowed_updates=["message"])
+        except TelegramConflictError:
+            logger.warning("Конфликт: активен webhook. Удаляю и перезапускаю polling…")
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить webhook: {e!r}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)  # экспоненциальный бэкофф до 30с
+            continue
+        except Exception as e:
+            logger.exception(f"Неожиданная ошибка polling: {e!r}. Рестарт через 3с…")
+            await asyncio.sleep(3)
+            continue
 
 if __name__ == "__main__":
     asyncio.run(main())
